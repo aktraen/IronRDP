@@ -4,7 +4,7 @@ use ironrdp_core::impl_as_any;
 use ironrdp_dvc::{DvcClientProcessor, DvcMessage, DvcProcessor};
 use ironrdp_pdu::{PduResult, pdu_other_err};
 use ironrdp_svc::SvcMessage;
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 
 use crate::worker::{OnWriteDvcMessage, WorkerCtx, run_worker};
 
@@ -129,6 +129,12 @@ impl DvcClientProcessor for DvcNamedPipeProxy {}
 
 impl Drop for DvcNamedPipeProxy {
     fn drop(&mut self) {
+        info!(
+            channel_name = %self.channel_name,
+            pipe_name = %self.named_pipe_name,
+            has_worker = self.worker.is_some(),
+            "Dropping DVC named pipe proxy"
+        );
         if let Some(ctx) = &self.worker {
             // Signal the worker thread to abort.
             ctx.abort_event.notify_one();
