@@ -129,14 +129,13 @@ impl DvcClientProcessor for DvcNamedPipeProxy {}
 
 impl Drop for DvcNamedPipeProxy {
     fn drop(&mut self) {
-        info!(
-            channel_name = %self.channel_name,
-            pipe_name = %self.named_pipe_name,
-            has_worker = self.worker.is_some(),
-            "Dropping DVC named pipe proxy"
-        );
         if let Some(ctx) = &self.worker {
             // Signal the worker thread to abort.
+            info!(
+                channel_name = %self.channel_name,
+                pipe_name = %self.named_pipe_name,
+                "Dropping DVC named pipe proxy"
+            );
             ctx.abort_event.notify_one();
         }
         self.worker = None;
