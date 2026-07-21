@@ -6,6 +6,71 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [[0.9.1](https://github.com/Devolutions/IronRDP/compare/ironrdp-graphics-v0.9.0...ironrdp-graphics-v0.9.1)] - 2026-07-21
+
+### <!-- 5 -->Performance
+
+- Portable SIMD inverse DWT (wide + SWAR) ([#1383](https://github.com/Devolutions/IronRDP/issues/1383)) ([629154026d](https://github.com/Devolutions/IronRDP/commit/629154026de0eaaf16b93352b4cecbae49a87511)) 
+
+  ## Summary
+  
+  On the WASM web client, frame **decode** dominates (~93% of frame time
+  on a 1080p RemoteFX replay), and within decode the **RFX inverse DWT was
+  ~48%** (the YCbCr→RGBA convert is already SIMD via `yuv`; the
+  entropy/RLE stages are inherently sequential). This vectorizes the
+  inverse DWT with the portable [`wide`](https://crates.io/crates/wide)
+  crate (`i16x8`), so the same code lowers to **wasm `simd128`, x86
+  SSE/AVX, and ARM NEON** — desktop and browser both benefit.
+  
+  The encode path is unchanged.
+  
+  ## How it stays bit-exact (no `unsafe`, no `cfg` split)
+  
+  The lifting steps need i32 intermediates only for the averages.
+  Overflow-free SWAR identities let the whole kernel stay in `i16` lanes
+  (no widen/narrow):
+  
+  - `ceil_avg(a,b)  = (a|b) - ((a^b)>>1)`  ≡ `(a + b + 1) >> 1`
+  - `floor_avg(a,b) = (a&b) + ((a^b)>>1)`  ≡ `(a + b) >> 1`
+  
+  and `(2x+1)>>1 == x` / `(x+x)>>1 == x` simplify the first/last rows.
+  Every other op is wrapping `i16` arithmetic, identical to the old
+  `i32`-intermediate-then-`as i16` truncation.
+  
+  ## Performance
+  
+  1080p RemoteFX replay, headless Chromium, wasm release `+simd128`,
+  8-pass median:
+  
+  | inverse DWT | decode (ms) |
+  |---|--:|
+  | scalar (baseline) | ~1598 |
+  | **portable `wide` SIMD** | **~985** |
+  
+  → inverse DWT ~2×, **~39% off the decode stage**. (Absolute ms carry
+  ~±15% machine-load noise; the ratio is stable. Per-frame this is a
+  throughput win — decode was already within real-time budget.)
+  
+  ## Correctness
+  
+  Verified bit-exact three ways:
+  - the replay-bench **framebuffer CRC32** is unchanged,
+  - the existing **native DWT tests** pass (so it's exact on x86 too, not
+  just wasm),
+  - an **exhaustive** check of the SWAR identities over all `i16 × i16`
+  pairs (0 mismatches).
+  
+  ## Notes
+  
+  - `wide` is a single-user dep in `ironrdp-graphics`; chosen over
+  `std::simd` (still nightly-only) and over per-arch intrinsics (one
+  portable kernel vs three).
+  - Reproducible bench branches: `bench/draw-*` (renderer) and the DWT
+  measurements were taken on the replay-bench harness branch (the capture
+  corpus is gitignored).
+
+
+
 ## [[0.9.0](https://github.com/Devolutions/IronRDP/compare/ironrdp-graphics-v0.8.1...ironrdp-graphics-v0.9.0)] - 2026-07-10
 
 ### <!-- 4 -->Bug Fixes

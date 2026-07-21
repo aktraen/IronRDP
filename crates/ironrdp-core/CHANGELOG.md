@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [[0.2.2](https://github.com/Devolutions/IronRDP/compare/ironrdp-core-v0.2.1...ironrdp-core-v0.2.2)] - 2026-07-21
+
+### <!-- 1 -->Features
+
+- Add NonEmpty<T> ([#1444](https://github.com/Devolutions/IronRDP/issues/1444)) ([bdcc0ceec3](https://github.com/Devolutions/IronRDP/commit/bdcc0ceec3aaa19441917db02c36cd3be2f58465)) 
+
+  Add a `NonEmpty<T>` collection guaranteeing at least one element. The
+  first element (head) is stored inline, so a single-element `NonEmpty`
+  performs no heap allocation, and `first()` is infallible while `len()`
+  returns a `NonZeroUsize`, and callers never branch on an "is it empty?"
+  case.
+
+
+
 ## [[0.2.1](https://github.com/Devolutions/IronRDP/compare/ironrdp-core-v0.2.0...ironrdp-core-v0.2.1)] - 2026-07-10
 
 ### <!-- 1 -->Features
