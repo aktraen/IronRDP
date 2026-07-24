@@ -125,8 +125,6 @@
 
     let containerResizeObserver: ResizeObserver | undefined;
     let dynamicResizeTimer: ReturnType<typeof setTimeout> | undefined;
-    let lastGuestWidth = 0;
-    let lastGuestHeight = 0;
 
     function evenClamp(value: number, min: number, max: number): number {
         const clamped = Math.max(min, Math.min(max, Math.floor(value)));
@@ -135,11 +133,10 @@
 
     function requestGuestResize() {
         const { x, y } = getContainerSize();
-        const width = evenClamp(x, 200, 8192);
-        const height = evenClamp(y, 200, 8192);
-        if (width > 0 && height > 0 && (width !== lastGuestWidth || height !== lastGuestHeight)) {
-            lastGuestWidth = width;
-            lastGuestHeight = height;
+        const dpr = typeof window !== 'undefined' && window.devicePixelRatio ? window.devicePixelRatio : 1;
+        const width = evenClamp(x * dpr, 200, 8192);
+        const height = evenClamp(y * dpr, 200, 8192);
+        if (width > 0 && height > 0 && (width !== canvas.width || height !== canvas.height)) {
             remoteDesktopService.resizeDynamic(width, height);
         }
     }
@@ -189,8 +186,8 @@
         });
 
         remoteDesktopService.dynamicResizeObservable.subscribe((evt) => {
-            loggingService.info(`Dynamic resize!, width: ${evt.width}, height: ${evt.height}`);
-            setViewerStyle(evt.height.toString() + 'px', evt.width.toString() + 'px', true);
+            loggingService.info(`Dynamic resize requested: ${evt.width}x${evt.height}`);
+            scaleSession(scale);
         });
 
         remoteDesktopService.changeVisibilityObservable.subscribe((val) => {
