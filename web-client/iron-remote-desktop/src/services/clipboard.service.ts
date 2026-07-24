@@ -216,6 +216,18 @@ export class ClipboardService {
         }
     }
 
+    async pasteText(text: string): Promise<void> {
+        if (!text) {
+            return;
+        }
+        const clipboardData = new this.module.ClipboardData();
+        clipboardData.addText('text/plain', text);
+        if (!clipboardData.isEmpty()) {
+            this.lastSentClipboardData = clipboardData;
+            await this.remoteDesktopService.onClipboardChanged(clipboardData);
+        }
+    }
+
     private scheduleOnMonitorClipboardUpdate() {
         setTimeout(this.onMonitorClipboard.bind(this), CLIPBOARD_MONITORING_INTERVAL_MS);
     }

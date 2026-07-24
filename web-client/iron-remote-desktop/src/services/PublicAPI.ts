@@ -93,6 +93,10 @@ export class PublicAPI {
         return await this.clipboardService.sendClipboardData();
     }
 
+    private async pasteClipboardText(text: string): Promise<void> {
+        return await this.clipboardService.pasteText(text);
+    }
+
     private invokeExtension(ext: Extension) {
         this.remoteDesktopService.invokeExtension(ext);
     }
@@ -133,6 +137,7 @@ export class PublicAPI {
             setEnableAutoClipboard: this.setEnableAutoClipboard.bind(this),
             saveRemoteClipboardData: this.saveRemoteClipboardData.bind(this),
             sendClipboardData: this.sendClipboardData.bind(this),
+            pasteClipboardText: this.pasteClipboardText.bind(this),
             invokeExtension: this.invokeExtension.bind(this),
             enableFileTransfer: this.enableFileTransfer.bind(this),
         };

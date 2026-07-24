@@ -30,11 +30,13 @@
         verbose,
         flexcenter,
         module,
+        dynamicresize,
     }: {
         scale: string;
         verbose: 'true' | 'false';
         flexcenter: string;
         module: RemoteDesktopModule;
+        dynamicresize?: string;
     } = $props();
 
     let isVisible = $state(false);
@@ -113,9 +115,37 @@
     }
 
     let containerResizeObserver: ResizeObserver | undefined;
+    let dynamicResizeTimer: ReturnType<typeof setTimeout> | undefined;
+    let lastGuestWidth = 0;
+    let lastGuestHeight = 0;
+
+    function evenClamp(value: number, min: number, max: number): number {
+        const clamped = Math.max(min, Math.min(max, Math.floor(value)));
+        return clamped % 2 === 0 ? clamped : clamped - 1;
+    }
+
+    function requestGuestResize() {
+        const { x, y } = getContainerSize();
+        const width = evenClamp(x, 200, 8192);
+        const height = evenClamp(y, 200, 8192);
+        if (width > 0 && height > 0 && (width !== lastGuestWidth || height !== lastGuestHeight)) {
+            lastGuestWidth = width;
+            lastGuestHeight = height;
+            remoteDesktopService.resizeDynamic(width, height);
+        }
+    }
+
+    function scheduleGuestResize() {
+        if (dynamicresize !== 'true' || !isVisible) {
+            return;
+        }
+        clearTimeout(dynamicResizeTimer);
+        dynamicResizeTimer = setTimeout(requestGuestResize, 250);
+    }
 
     const resizeHandler = (_evt: UIEvent) => {
         scaleSession(scale);
+        scheduleGuestResize();
     };
 
     function observeContainer() {
@@ -126,6 +156,7 @@
         }
         containerResizeObserver = new ResizeObserver(() => {
             scaleSession(scale);
+            scheduleGuestResize();
         });
         containerResizeObserver.observe(hostEl);
     }
@@ -377,6 +408,7 @@
         window.removeEventListener('blur', blurEventHandler);
         document.removeEventListener('visibilitychange', visibilityChangeHandler);
         containerResizeObserver?.disconnect();
+        clearTimeout(dynamicResizeTimer);
         isComponentDestroyed.set(true);
     });
 </script>
