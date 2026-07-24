@@ -76,6 +76,15 @@
         window.addEventListener('focus', focusEventHandler);
         window.addEventListener('blur', blurEventHandler);
         document.addEventListener('visibilitychange', visibilityChangeHandler);
+        document.addEventListener('fullscreenchange', fullscreenChangeHandler);
+    }
+
+    function fullscreenChangeHandler() {
+        if (!isVisible) {
+            return;
+        }
+        setWrapperStyle('100%', '100%', 'hidden');
+        setTimeout(() => scaleSession(scale), 150);
     }
 
     function resetHostStyle() {
@@ -407,6 +416,7 @@
         window.removeEventListener('focus', focusEventHandler);
         window.removeEventListener('blur', blurEventHandler);
         document.removeEventListener('visibilitychange', visibilityChangeHandler);
+        document.removeEventListener('fullscreenchange', fullscreenChangeHandler);
         containerResizeObserver?.disconnect();
         clearTimeout(dynamicResizeTimer);
         isComponentDestroyed.set(true);
