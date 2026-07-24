@@ -133,9 +133,8 @@
 
     function requestGuestResize() {
         const { x, y } = getContainerSize();
-        const dpr = typeof window !== 'undefined' && window.devicePixelRatio ? window.devicePixelRatio : 1;
-        const width = evenClamp(x * dpr, 200, 8192);
-        const height = evenClamp(y * dpr, 200, 8192);
+        const width = evenClamp(x, 200, 8192);
+        const height = evenClamp(y, 200, 8192);
         if (width > 0 && height > 0 && (width !== canvas.width || height !== canvas.height)) {
             remoteDesktopService.resizeDynamic(width, height);
         }
@@ -146,7 +145,7 @@
             return;
         }
         clearTimeout(dynamicResizeTimer);
-        dynamicResizeTimer = setTimeout(requestGuestResize, 250);
+        dynamicResizeTimer = setTimeout(requestGuestResize, 400);
     }
 
     const resizeHandler = (_evt: UIEvent) => {
