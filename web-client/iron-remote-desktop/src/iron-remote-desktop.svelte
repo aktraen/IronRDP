@@ -112,9 +112,23 @@
         wrapperStyle = `height: ${height}; width: ${width}; overflow: ${overflow}`;
     }
 
+    let containerResizeObserver: ResizeObserver | undefined;
+
     const resizeHandler = (_evt: UIEvent) => {
         scaleSession(scale);
     };
+
+    function observeContainer() {
+        const root = wrapper?.getRootNode?.() as ShadowRoot | Document | undefined;
+        const hostEl = root && 'host' in root ? (root.host as HTMLElement) : undefined;
+        if (!hostEl || typeof ResizeObserver === 'undefined') {
+            return;
+        }
+        containerResizeObserver = new ResizeObserver(() => {
+            scaleSession(scale);
+        });
+        containerResizeObserver.observe(hostEl);
+    }
 
     function serverBridgeListeners() {
         remoteDesktopService.resizeObservable.subscribe((evt: ResizeEvent) => {
@@ -127,6 +141,7 @@
 
     function userInteractionListeners() {
         window.addEventListener('resize', resizeHandler);
+        observeContainer();
 
         remoteDesktopService.scaleObservable.subscribe((s) => {
             loggingService.info('Change scale!');
@@ -182,10 +197,10 @@
     }
 
     function fullResize() {
-        const windowSize = getWindowSize();
+        const containerSize = getContainerSize();
 
-        const containerWidth = windowSize.x;
-        const containerHeight = windowSize.y;
+        const containerWidth = containerSize.x;
+        const containerHeight = containerSize.y;
 
         let width = canvas.width;
         let height = canvas.height;
@@ -203,11 +218,10 @@
     }
 
     function fitResize(realSizeLimit = false) {
-        const windowSize = getWindowSize();
-        const wrapperBoundingBox = wrapper.getBoundingClientRect();
+        const containerSize = getContainerSize();
 
-        const containerWidth = windowSize.x - wrapperBoundingBox.x;
-        const containerHeight = windowSize.y - wrapperBoundingBox.y;
+        const containerWidth = containerSize.x;
+        const containerHeight = containerSize.y;
 
         let width = canvas.width;
         let height = canvas.height;
@@ -227,11 +241,10 @@
     }
 
     function realResize() {
-        const windowSize = getWindowSize();
-        const wrapperBoundingBox = wrapper.getBoundingClientRect();
+        const containerSize = getContainerSize();
 
-        const containerWidth = windowSize.x - wrapperBoundingBox.x;
-        const containerHeight = windowSize.y - wrapperBoundingBox.y;
+        const containerWidth = containerSize.x;
+        const containerHeight = containerSize.y;
 
         if (containerWidth < canvas.width || containerHeight < canvas.height) {
             setWrapperStyle(
@@ -294,6 +307,15 @@
         return { x, y };
     }
 
+    function getContainerSize() {
+        const root = wrapper?.getRootNode?.() as ShadowRoot | Document | undefined;
+        const hostEl = root && 'host' in root ? (root.host as HTMLElement) : undefined;
+        if (hostEl && hostEl.clientWidth > 0 && hostEl.clientHeight > 0) {
+            return { x: hostEl.clientWidth, y: hostEl.clientHeight };
+        }
+        return getWindowSize();
+    }
+
     async function initcanvas() {
         loggingService.info('Start canvas initialization...');
 
@@ -354,6 +376,7 @@
         window.removeEventListener('focus', focusEventHandler);
         window.removeEventListener('blur', blurEventHandler);
         document.removeEventListener('visibilitychange', visibilityChangeHandler);
+        containerResizeObserver?.disconnect();
         isComponentDestroyed.set(true);
     });
 </script>
