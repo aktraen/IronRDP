@@ -207,6 +207,13 @@
     function scaleSession(screenScale: ScreenScale | string) {
         resetHostStyle();
         if (isVisible) {
+            if (dynamicresize === 'true') {
+                const fillSize = getContainerSize();
+                setWrapperStyle('initial', 'initial', 'hidden');
+                setViewerStyle(`${fillSize.y}px`, `${fillSize.x}px`, true);
+                setHostStyle(false);
+                return;
+            }
             switch (screenScale) {
                 case 'fit':
                 case ScreenScale.Fit:
