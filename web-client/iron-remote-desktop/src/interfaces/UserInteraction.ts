@@ -43,6 +43,8 @@ export interface UserInteraction {
 
     sendClipboardData(): Promise<void>;
 
+    pasteClipboardText(text: string): Promise<void>;
+
     invokeExtension(ext: Extension): void;
 
     /**
