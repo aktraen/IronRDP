@@ -1131,13 +1131,26 @@ impl iron_remote_desktop::Session for Session {
         physical_width: Option<u32>,
         physical_height: Option<u32>,
     ) {
+        // xorgxrdp only RandR-reflows the guest X screen (rather than just growing the RDP
+        // framebuffer and leaving unpainted padding) when the DISPLAYCONTROL MONITOR_LAYOUT carries
+        // a desktop scale factor AND physical dimensions -- the same fields FreeRDP/guacd send for
+        // resize-method=display-update. A bare resize(w,h) from the browser leaves both None, so the
+        // guest reflowed only the surface. Default them from the resolution at 96 DPI so every resize
+        // sends a complete layout and the desktop content actually fills the new size.
+        let scale_factor = scale_factor.or(Some(100));
+        let physical_size = physical_width
+            .and_then(|width| physical_height.map(|height| (width, height)))
+            .or_else(|| {
+                let mm = |px: u32| ((f64::from(px) * 25.4 / 96.0).round() as u32).clamp(10, 10000);
+                Some((mm(width), mm(height)))
+            });
         if self
             .input_events_tx
             .unbounded_send(RdpInputEvent::Resize {
                 width,
                 height,
                 scale_factor,
-                physical_size: physical_width.and_then(|width| physical_height.map(|height| (width, height))),
+                physical_size,
             })
             .is_err()
         {
