@@ -394,7 +394,15 @@ export class RemoteDesktopService {
         }
 
         if (!evt.repeat || (!isModifierKey && !isLockKey)) {
-            const keyScanCode = scanCode(evt.code);
+            // For keyboard SHORTCUTS (a modifier is held) resolve the scancode from the CHARACTER the
+            // user typed, not the physical key position, so shortcuts are keyboard-layout independent
+            // (mirrors Guacamole's keysym approach): Ctrl+V pastes on QWERTY, BEPO, AZERTY alike. For
+            // plain typing (no modifier) the physical code path stays, since typed text goes as unicode.
+            let scanCodeSource = evt.code;
+            if (!sendAsUnicode && /^[a-z]$/i.test(evt.key)) {
+                scanCodeSource = 'Key' + evt.key.toUpperCase();
+            }
+            const keyScanCode = scanCode(scanCodeSource);
             const unknownScanCode = Number.isNaN(keyScanCode);
 
             if (!this.keyboardUnicodeMode && keyEvent && !unknownScanCode) {
