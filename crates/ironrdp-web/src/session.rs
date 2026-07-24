@@ -1385,6 +1385,12 @@ fn build_config(
     client_name: String,
     desktop_size: DesktopSize,
 ) -> connector::Config {
+    // aktraen: xrdp only auto-logs-in when the Client Info PDU carries INFO_AUTOLOGON;
+    // supplying username+password is NOT sufficient (proven live: "no autologin detected,
+    // draw login window"). The published WASM hardcodes this false (TODO(#327)). Derive it
+    // from credential presence — FreeRDP's own semantics (/u + /p implies autologon) — so the
+    // relay-supplied desktop credential lands the trainee on XFCE, not the xrdp login dialog.
+    let autologon = !username.is_empty() && !password.is_empty();
     connector::Config {
         credentials: Credentials::UsernamePassword { username, password },
         domain,
@@ -1421,7 +1427,7 @@ fn build_config(
         platform: ironrdp::pdu::rdp::capability_sets::MajorPlatformType::UNSPECIFIED,
         compression_type: None,
         enable_server_pointer: false,
-        autologon: false,
+        autologon,
         enable_audio_playback: false,
         request_data: None,
         pointer_software_rendering: false,
