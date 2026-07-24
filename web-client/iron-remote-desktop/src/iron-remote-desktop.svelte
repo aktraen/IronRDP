@@ -145,7 +145,7 @@
             return;
         }
         clearTimeout(dynamicResizeTimer);
-        dynamicResizeTimer = setTimeout(requestGuestResize, 400);
+        dynamicResizeTimer = setTimeout(requestGuestResize, 150);
     }
 
     const resizeHandler = (_evt: UIEvent) => {
