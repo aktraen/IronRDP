@@ -6,6 +6,22 @@ use tracing::warn;
 #[derive(Clone)]
 pub(crate) struct DeviceEvent(Operation);
 
+/// Remap the left/right Meta ("Windows"/Command/Super) scancodes to Left Control.
+///
+/// On macOS the Command key is the primary shortcut modifier, but the trainee
+/// desktop is Linux, where shortcuts use Control. Sending Meta as Left Control
+/// lets Cmd+C / Cmd+V / Cmd+A behave like the host OS's command key. Regular
+/// typing is unaffected: it flows through the Unicode path, not scancodes.
+fn meta_to_ctrl(scancode: u16) -> u16 {
+    const META_LEFT: u16 = 0xE05B;
+    const META_RIGHT: u16 = 0xE05C;
+    const CONTROL_LEFT: u16 = 0x001D;
+    match scancode {
+        META_LEFT | META_RIGHT => CONTROL_LEFT,
+        other => other,
+    }
+}
+
 impl iron_remote_desktop::DeviceEvent for DeviceEvent {
     fn mouse_button_pressed(button: u8) -> Self {
         match MouseButton::from_web_button(button) {
@@ -52,11 +68,11 @@ impl iron_remote_desktop::DeviceEvent for DeviceEvent {
     }
 
     fn key_pressed(scancode: u16) -> Self {
-        Self(Operation::KeyPressed(Scancode::from_u16(scancode)))
+        Self(Operation::KeyPressed(Scancode::from_u16(meta_to_ctrl(scancode))))
     }
 
     fn key_released(scancode: u16) -> Self {
-        Self(Operation::KeyReleased(Scancode::from_u16(scancode)))
+        Self(Operation::KeyReleased(Scancode::from_u16(meta_to_ctrl(scancode))))
     }
 
     fn unicode_pressed(unicode: char) -> Self {
