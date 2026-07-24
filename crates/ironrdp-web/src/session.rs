@@ -36,9 +36,21 @@ use ironrdp_futures::{FramedWrite, single_sequence_step_read};
 use rgb::AsPixels as _;
 use tap::prelude::*;
 use tracing::{debug, error, info, trace, warn};
+use wasm_bindgen::closure::Closure;
+use wasm_bindgen::prelude::wasm_bindgen;
 use wasm_bindgen::{JsCast as _, JsValue};
 use wasm_bindgen_futures::spawn_local;
 use web_sys::HtmlCanvasElement;
+
+// aktraen: defer a JS callback to a microtask so it runs AFTER the current executor poll
+// releases its borrow. Calling set_cursor_style's JS callback synchronously inside the run()
+// Task's poll re-enters the single-threaded futures executor during a drag (rapid cursor
+// updates) -> "RefCell already borrowed" abort. queueMicrotask bypasses the executor entirely.
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_name = queueMicrotask)]
+    fn queue_microtask(cb: &js_sys::Function);
+}
 
 use crate::canvas::Canvas;
 use crate::clipboard;
@@ -588,10 +600,16 @@ impl Session {
             JsValue::from_f64(hotspot_y.unwrap_or_default().into()),
         ]);
 
-        let _ret = self
-            .set_cursor_style_callback
-            .apply(&self.set_cursor_style_callback_context, &args)
-            .map_err(|e| anyhow::Error::msg(format!("set cursor style callback failed: {e:?}")))?;
+        // aktraen: defer the JS callback out of the current executor poll (see queue_microtask
+        // above). Fire-and-forget: JS holds the once-closure until it runs, then frees it.
+        let callback = self.set_cursor_style_callback.clone();
+        let context = self.set_cursor_style_callback_context.clone();
+        let deferred = Closure::once_into_js(move || {
+            if let Err(e) = callback.apply(&context, &args) {
+                error!("set cursor style callback failed: {e:?}");
+            }
+        });
+        queue_microtask(deferred.unchecked_ref());
 
         Ok(())
     }
@@ -1408,7 +1426,10 @@ fn build_config(
             height: desktop_size.height,
         },
         bitmap: Some(connector::BitmapConfig {
-            color_depth: 16,
+            // aktraen: 16bpp makes xrdp send interleaved-RLE bitmaps that IronRDP's decoder desyncs
+            // on ("Invalid RLE-compressed bitmap: not enough bytes") -> corrupt tiles. 32bpp routes
+            // to the RDP6 planar (or clean uncompressed) decoder and matches pref_bits_per_pix:32.
+            color_depth: 32,
             lossy_compression: true,
             codecs: client_codecs_capabilities(&[]).expect("can't panic for &[]"),
         }),
