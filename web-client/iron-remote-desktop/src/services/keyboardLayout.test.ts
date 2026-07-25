@@ -321,4 +321,30 @@ describe('Shift neutralization around Unicode characters (BEPO Shift+number row)
         press('Digit3', '/', { ctrlKey: true, altKey: true });
         expect(mod.DeviceEvent.unicodePressed).toHaveBeenCalledWith('/');
     });
+
+    it('does NOT strand Shift when the mirror is stale but Shift is not really held (no re-press)', () => {
+        // A lone Shift keyup (focus gained mid-hold) pushes a PHANTOM ShiftLeft into
+        // modifierKeyPressed while the guest's Shift is UP. Typing a char with Shift not actually
+        // held must NOT release/re-press Shift (a re-press would strand Shift down on the guest and
+        // shift every subsequent key). The neutralization is gated on the event's own evt.shiftKey,
+        // so with the phantom present but evt.shiftKey === false, no Shift toggling occurs.
+        service.sendKeyboardEvent(new KeyboardEvent('keyup', { code: 'ShiftLeft', key: 'Shift' }));
+        expect(service.modifierKeyPressed).toContain('ShiftLeft'); // phantom seeded
+        vi.clearAllMocks();
+
+        press('KeyA', 'a'); // evt.shiftKey defaults to false
+
+        expect(mod.DeviceEvent.unicodePressed).toHaveBeenCalledWith('a');
+        expect(mod.DeviceEvent.keyPressed).not.toHaveBeenCalled();
+        expect(mod.DeviceEvent.keyReleased).not.toHaveBeenCalled();
+    });
+
+    it('releaseAllInputs (blur/focusLost/mouseOut) resets the modifier mirror', () => {
+        press('ShiftLeft', 'Shift', { shiftKey: true });
+        expect(service.modifierKeyPressed.length).toBeGreaterThan(0);
+
+        service.focusLost();
+
+        expect(service.modifierKeyPressed).toEqual([]);
+    });
 });
