@@ -183,3 +183,142 @@ describe('AltGr-composed characters (BEPO / AZERTY typing of / { } | @ ...)', ()
         expect(mod.DeviceEvent.unicodePressed).not.toHaveBeenCalled();
     });
 });
+
+/**
+ * Regression tests for the BEPO Shift+number-row bug (founder-reported).
+ *
+ * Bug: on a BEPO layout the number row's SHIFTED level types the DIGITS
+ * 1234567890, but the physical Shift keydown is forwarded to the guest as a Shift
+ * SCANCODE that stays held while the digit is injected as a Unicode character.
+ * The guest re-applies Shift to that injection and yields the guest-layout shifted
+ * symbol (!@#$%^&*() on a US guest) instead of the digit. Unshifted typing works
+ * (no Shift held), and Shift+letter looks fine (uppercase keysym is unchanged by
+ * Shift), which is exactly what the founder observed.
+ *
+ * Fix: mirror Guacamole's release_simulated_altgr. When a printable character is
+ * sent as Unicode while Shift is physically held, release the held Shift
+ * scancode(s) BEFORE the character and re-press them AFTER, so the guest sees a
+ * clean Unicode injection yet Shift stays held for subsequent Shift+navigation
+ * (text selection). Only the Shift key(s) actually down (tracked in
+ * modifierKeyPressed) are toggled, so a Shift that was never pressed is never
+ * stranded.
+ */
+describe('Shift neutralization around Unicode characters (BEPO Shift+number row)', () => {
+    let service: RemoteDesktopService;
+    let mod: RemoteDesktopModule;
+
+    const SHIFT_L = scanCode('ShiftLeft');
+    const SHIFT_R = scanCode('ShiftRight');
+    const ARROW_LEFT = scanCode('ArrowLeft');
+
+    beforeEach(() => {
+        vi.clearAllMocks();
+        mod = createMockModule();
+        service = new RemoteDesktopService(mod);
+        service.session = createMockSession();
+        service.setKeyboardUnicodeMode(true);
+    });
+
+    function press(code: string, k: string, mods: Partial<KeyboardEventInit> = {}) {
+        service.sendKeyboardEvent(new KeyboardEvent('keydown', { code, key: k, ...mods }));
+    }
+
+    it('sanity: Shift scancodes resolve', () => {
+        expect(SHIFT_L).toBe(0x2a);
+        expect(SHIFT_R).toBe(0x36);
+    });
+
+    it('BEPO Shift+Digit1 types "1" as Unicode with ShiftLeft released before and re-pressed after', () => {
+        press('ShiftLeft', 'Shift', { shiftKey: true });
+        vi.clearAllMocks();
+
+        press('Digit1', '1', { shiftKey: true });
+
+        expect(mod.DeviceEvent.keyReleased).toHaveBeenCalledWith(SHIFT_L);
+        expect(mod.DeviceEvent.unicodePressed).toHaveBeenCalledWith('1');
+        expect(mod.DeviceEvent.keyPressed).toHaveBeenCalledWith(SHIFT_L);
+
+        // Order must be: release Shift -> inject char -> re-press Shift.
+        const relOrder = (mod.DeviceEvent.keyReleased as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+        const uniOrder = (mod.DeviceEvent.unicodePressed as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+        const preOrder = (mod.DeviceEvent.keyPressed as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+        expect(relOrder).toBeLessThan(uniOrder);
+        expect(uniOrder).toBeLessThan(preOrder);
+    });
+
+    it('no net Shift dangling: exactly one release and one matching re-press of the held Shift', () => {
+        press('ShiftLeft', 'Shift', { shiftKey: true });
+        vi.clearAllMocks();
+
+        press('Digit5', '5', { shiftKey: true });
+
+        const releasedShift = (mod.DeviceEvent.keyReleased as ReturnType<typeof vi.fn>).mock.calls.filter(
+            ([sc]) => sc === SHIFT_L,
+        );
+        const pressedShift = (mod.DeviceEvent.keyPressed as ReturnType<typeof vi.fn>).mock.calls.filter(
+            ([sc]) => sc === SHIFT_L,
+        );
+        expect(releasedShift).toHaveLength(1);
+        expect(pressedShift).toHaveLength(1);
+    });
+
+    it('restores only the Shift actually held: ShiftLeft down does not touch ShiftRight', () => {
+        press('ShiftLeft', 'Shift', { shiftKey: true });
+        vi.clearAllMocks();
+
+        press('Digit2', '2', { shiftKey: true });
+
+        expect(mod.DeviceEvent.keyReleased).not.toHaveBeenCalledWith(SHIFT_R);
+        expect(mod.DeviceEvent.keyPressed).not.toHaveBeenCalledWith(SHIFT_R);
+    });
+
+    it('ShiftRight held neutralizes ShiftRight (not ShiftLeft)', () => {
+        press('ShiftRight', 'Shift', { shiftKey: true });
+        vi.clearAllMocks();
+
+        press('Digit3', '3', { shiftKey: true });
+
+        expect(mod.DeviceEvent.keyReleased).toHaveBeenCalledWith(SHIFT_R);
+        expect(mod.DeviceEvent.keyPressed).toHaveBeenCalledWith(SHIFT_R);
+        expect(mod.DeviceEvent.keyReleased).not.toHaveBeenCalledWith(SHIFT_L);
+    });
+
+    it('Shift+letter still types the uppercase letter (as Unicode), Shift neutralized around it', () => {
+        press('ShiftLeft', 'Shift', { shiftKey: true });
+        vi.clearAllMocks();
+
+        press('KeyV', 'V', { shiftKey: true });
+
+        expect(mod.DeviceEvent.unicodePressed).toHaveBeenCalledWith('V');
+        expect(mod.DeviceEvent.keyReleased).toHaveBeenCalledWith(SHIFT_L);
+        expect(mod.DeviceEvent.keyPressed).toHaveBeenCalledWith(SHIFT_L);
+    });
+
+    it('Shift+ArrowLeft (text selection) still sends the Arrow scancode with Shift held', () => {
+        press('ShiftLeft', 'Shift', { shiftKey: true });
+        // Type a shifted digit first: Shift is released then RESTORED, so it stays held.
+        press('Digit1', '1', { shiftKey: true });
+        vi.clearAllMocks();
+
+        press('ArrowLeft', 'ArrowLeft', { shiftKey: true });
+
+        // Navigation goes via scancode (not Unicode), so the guest's still-held Shift selects.
+        expect(mod.DeviceEvent.keyPressed).toHaveBeenCalledWith(ARROW_LEFT);
+        expect(mod.DeviceEvent.unicodePressed).not.toHaveBeenCalled();
+    });
+
+    it('plain digit typing (no Shift) is unchanged: pure Unicode, no Shift toggling', () => {
+        press('Digit1', '1');
+
+        expect(mod.DeviceEvent.unicodePressed).toHaveBeenCalledWith('1');
+        expect(mod.DeviceEvent.keyReleased).not.toHaveBeenCalled();
+        expect(mod.DeviceEvent.keyPressed).not.toHaveBeenCalled();
+    });
+
+    it('Ctrl+Alt+Shift AltGr composition path is unaffected by Shift neutralization', () => {
+        // AltGr-composed non-letter still goes through the composed-char branch (Ctrl/Alt released,
+        // char as Unicode) regardless of the new Shift handling.
+        press('Digit3', '/', { ctrlKey: true, altKey: true });
+        expect(mod.DeviceEvent.unicodePressed).toHaveBeenCalledWith('/');
+    });
+});

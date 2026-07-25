@@ -453,7 +453,30 @@ export class RemoteDesktopService {
                 const isUnicodeCharacter = Number.isNaN(keyCode) && evt.key.length === 1 && !isModifierKey;
 
                 if (isUnicodeCharacter && sendAsUnicode) {
-                    this.doTransactionFromDeviceEvents([unicodeEvent(evt.key)]);
+                    // The character is injected as Unicode (WYSIWYG: the OS already resolved which
+                    // glyph the key produces). A physically-held Shift would be re-applied by the
+                    // guest to that injection and corrupt it: on BEPO/AZERTY the number row's SHIFTED
+                    // level types the DIGITS 1234567890, but with the Shift scancode still down the
+                    // guest yields the guest-layout shifted symbol (!@#$%^&*() on a US guest) instead.
+                    // Mirror Guacamole's release_simulated_altgr (Keyboard.js): release the held
+                    // modifier scancode(s) around the character, then RESTORE them so subsequent
+                    // Shift+navigation (Shift+ArrowLeft/Home/End text selection) still applies Shift.
+                    // Only the Shift key(s) actually down are toggled (tracked via modifierKeyPressed),
+                    // so a Shift that was never pressed is never stranded down.
+                    const heldShiftScanCodes = evt.type === 'keydown' ? this.heldShiftScanCodes() : [];
+                    if (heldShiftScanCodes.length > 0) {
+                        const events: DeviceEvent[] = [];
+                        for (const sc of heldShiftScanCodes) {
+                            events.push(this.module.DeviceEvent.keyReleased(sc));
+                        }
+                        events.push(unicodeEvent(evt.key));
+                        for (const sc of heldShiftScanCodes) {
+                            events.push(this.module.DeviceEvent.keyPressed(sc));
+                        }
+                        this.doTransactionFromDeviceEvents(events);
+                    } else {
+                        this.doTransactionFromDeviceEvents([unicodeEvent(evt.key)]);
+                    }
                 } else if (!unknownScanCode) {
                     // Use scancode instead of key code for non-unicode character values
                     this.doTransactionFromDeviceEvents([keyEvent(keyScanCode)]);
@@ -523,6 +546,26 @@ export class RemoteDesktopService {
             syncCapsLockActive,
             syncKanaModeActive,
         );
+    }
+
+    /// Windows scancodes for the Shift key(s) currently held down, as tracked in
+    /// modifierKeyPressed (i.e. the ones we actually pressed on the guest). Used to
+    /// neutralize Shift around a Unicode character injection without stranding a Shift
+    /// that was never pressed.
+    private heldShiftScanCodes(): number[] {
+        const codes: number[] = [];
+        for (const [modifier, keyCode] of [
+            [ModifierKey.SHIFT_LEFT, 'ShiftLeft'],
+            [ModifierKey.SHIFT_RIGHT, 'ShiftRight'],
+        ] as const) {
+            if (this.modifierKeyPressed.indexOf(modifier) !== -1) {
+                const sc = scanCode(keyCode);
+                if (!Number.isNaN(sc)) {
+                    codes.push(sc);
+                }
+            }
+        }
+        return codes;
     }
 
     private updateModifierKeyState(evt: KeyboardEvent) {
