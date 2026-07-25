@@ -385,6 +385,24 @@ export class RemoteDesktopService {
         const isModifierKey = evt.code in ModifierKey;
         const isLockKey = evt.code in LockKey;
 
+        // AltGr-composed characters (BEPO/AZERTY `/`, `{`, `}`, `|`, `@`, `#`, `~`, `\`, `€`, ...)
+        // must be typed as the resulting character, not as a physical scancode routed through the
+        // guest layout while AltGr is held. Mirrors Guacamole's release_simulated_altgr: for a
+        // printable non-letter produced with Alt/AltGr (but not a Ctrl/Meta command chord), send the
+        // character as Unicode and release the Ctrl/Alt modifiers first so the guest sees a clean char.
+        // Letters are excluded so Ctrl+Alt+<letter> stays a shortcut (Guacamole assumes letters never
+        // need AltGr).
+        const codePoint = evt.key.length === 1 ? evt.key.codePointAt(0) ?? 0 : 0;
+        const isComposedChar =
+            this.keyboardUnicodeMode &&
+            codePoint >= 0x20 &&
+            codePoint !== 0x7f &&
+            !isModifierKey &&
+            !/^[a-z]$/i.test(evt.key) &&
+            (evt.altKey || evt.getModifierState('AltGraph')) &&
+            !evt.metaKey &&
+            !(evt.ctrlKey && !evt.altKey);
+
         if (isModifierKey) {
             this.updateModifierKeyState(evt);
         }
@@ -413,6 +431,21 @@ export class RemoteDesktopService {
             if (this.keyboardUnicodeMode && unicodeEvent && keyEvent) {
                 // `Dead` and `Unidentified` keys should be ignored
                 if (['Dead', 'Unidentified'].indexOf(evt.key) != -1) {
+                    return;
+                }
+
+                if (isComposedChar) {
+                    const events: DeviceEvent[] = [];
+                    if (evt.type === 'keydown') {
+                        for (const code of ['ControlLeft', 'ControlRight', 'AltLeft', 'AltRight']) {
+                            const modScanCode = scanCode(code);
+                            if (!Number.isNaN(modScanCode)) {
+                                events.push(this.module.DeviceEvent.keyReleased(modScanCode));
+                            }
+                        }
+                    }
+                    events.push(unicodeEvent(evt.key));
+                    this.doTransactionFromDeviceEvents(events);
                     return;
                 }
 

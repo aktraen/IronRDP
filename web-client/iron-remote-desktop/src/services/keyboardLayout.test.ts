@@ -121,3 +121,65 @@ describe('layout-independent keyboard shortcuts', () => {
         expect(mod.DeviceEvent.keyPressed).toHaveBeenCalledWith(scanCode('Digit1'));
     });
 });
+
+describe('AltGr-composed characters (BEPO / AZERTY typing of / { } | @ ...)', () => {
+    let service: RemoteDesktopService;
+    let mod: RemoteDesktopModule;
+
+    const CTRL_L = scanCode('ControlLeft');
+    const CTRL_R = scanCode('ControlRight');
+    const ALT_L = scanCode('AltLeft');
+    const ALT_R = scanCode('AltRight');
+
+    beforeEach(() => {
+        vi.clearAllMocks();
+        mod = createMockModule();
+        service = new RemoteDesktopService(mod);
+        service.session = createMockSession();
+        service.setKeyboardUnicodeMode(true);
+    });
+
+    function key(code: string, k: string, mods: Partial<KeyboardEventInit> = {}) {
+        service.sendKeyboardEvent(new KeyboardEvent('keydown', { code, key: k, ...mods }));
+    }
+
+    it('Windows AltGr (Ctrl+Alt) + "/" types "/" as Unicode and releases Ctrl+Alt first', () => {
+        key('Digit3', '/', { ctrlKey: true, altKey: true });
+        expect(mod.DeviceEvent.unicodePressed).toHaveBeenCalledWith('/');
+        expect(mod.DeviceEvent.keyReleased).toHaveBeenCalledWith(CTRL_L);
+        expect(mod.DeviceEvent.keyReleased).toHaveBeenCalledWith(CTRL_R);
+        expect(mod.DeviceEvent.keyReleased).toHaveBeenCalledWith(ALT_L);
+        expect(mod.DeviceEvent.keyReleased).toHaveBeenCalledWith(ALT_R);
+        expect(mod.DeviceEvent.keyPressed).not.toHaveBeenCalled();
+    });
+
+    it('Mac right-Option (altKey only) + "/" also types "/" as Unicode', () => {
+        key('Slash', '/', { altKey: true });
+        expect(mod.DeviceEvent.unicodePressed).toHaveBeenCalledWith('/');
+        expect(mod.DeviceEvent.keyReleased).toHaveBeenCalledWith(ALT_R);
+        expect(mod.DeviceEvent.keyPressed).not.toHaveBeenCalled();
+    });
+
+    it('AltGr + "€" (multi-byte) types the euro sign as Unicode', () => {
+        key('KeyE', '€', { ctrlKey: true, altKey: true });
+        expect(mod.DeviceEvent.unicodePressed).toHaveBeenCalledWith('€');
+        expect(mod.DeviceEvent.keyPressed).not.toHaveBeenCalled();
+    });
+
+    it('Ctrl+Alt+<letter> stays a shortcut (letters never need AltGr)', () => {
+        key('KeyT', 't', { ctrlKey: true, altKey: true });
+        expect(mod.DeviceEvent.keyPressed).toHaveBeenCalledWith(scanCode('KeyT'));
+        expect(mod.DeviceEvent.unicodePressed).not.toHaveBeenCalled();
+    });
+
+    it('Ctrl+"/" (no Alt) stays a shortcut on the scancode path', () => {
+        key('Slash', '/', { ctrlKey: true });
+        expect(mod.DeviceEvent.keyPressed).toHaveBeenCalledWith(scanCode('Slash'));
+        expect(mod.DeviceEvent.unicodePressed).not.toHaveBeenCalled();
+    });
+
+    it('Meta+"/" (Command shortcut) is not treated as composition', () => {
+        key('Slash', '/', { metaKey: true });
+        expect(mod.DeviceEvent.unicodePressed).not.toHaveBeenCalled();
+    });
+});
