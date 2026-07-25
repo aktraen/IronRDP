@@ -339,6 +339,10 @@ export class RemoteDesktopService {
     }
 
     private releaseAllInputs() {
+        // The guest releases every held key, so the local modifier mirror must be cleared too;
+        // otherwise it drifts (a phantom Shift left behind across blur/alt-tab/mouse-out would
+        // make the next Unicode-char neutralization re-press a Shift the guest no longer holds).
+        this.modifierKeyPressed = [];
         this.session?.releaseAllInputs();
     }
 
@@ -461,16 +465,24 @@ export class RemoteDesktopService {
                     // Mirror Guacamole's release_simulated_altgr (Keyboard.js): release the held
                     // modifier scancode(s) around the character, then RESTORE them so subsequent
                     // Shift+navigation (Shift+ArrowLeft/Home/End text selection) still applies Shift.
-                    // Only the Shift key(s) actually down are toggled (tracked via modifierKeyPressed),
-                    // so a Shift that was never pressed is never stranded down.
-                    const heldShiftScanCodes = evt.type === 'keydown' ? this.heldShiftScanCodes() : [];
-                    if (heldShiftScanCodes.length > 0) {
+                    //
+                    // Gate on THIS event's own Shift truth (evt.shiftKey), not the modifierKeyPressed
+                    // mirror. The mirror can drift out of sync with the guest's real Shift state
+                    // (releaseAllInputs releases the guest's keys without clearing it; a Shift keyup
+                    // seen without a preceding keydown after focus is gained mid-hold pushes a phantom
+                    // entry). If we re-pressed a Shift from a stale mirror while Shift is not really
+                    // held, we would STRAND Shift down on the guest and every later key would be
+                    // shifted. With the gate, a char typed while Shift is genuinely up never toggles
+                    // Shift. modifierKeyPressed is used only to pick WHICH side (Left/Right) to toggle.
+                    const shiftScanCodes =
+                        evt.type === 'keydown' && evt.shiftKey ? this.heldShiftScanCodes() : [];
+                    if (shiftScanCodes.length > 0) {
                         const events: DeviceEvent[] = [];
-                        for (const sc of heldShiftScanCodes) {
+                        for (const sc of shiftScanCodes) {
                             events.push(this.module.DeviceEvent.keyReleased(sc));
                         }
                         events.push(unicodeEvent(evt.key));
-                        for (const sc of heldShiftScanCodes) {
+                        for (const sc of shiftScanCodes) {
                             events.push(this.module.DeviceEvent.keyPressed(sc));
                         }
                         this.doTransactionFromDeviceEvents(events);
