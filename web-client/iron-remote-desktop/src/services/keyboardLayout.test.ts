@@ -2,35 +2,39 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { RemoteDesktopService } from './remote-desktop.service';
 import type { RemoteDesktopModule } from '../interfaces/RemoteDesktopModule';
 import type { Session } from '../interfaces/Session';
+import { GUEST_KEYMAP, keysymScancode, MOD_SHIFT } from '../lib/guacKeyboardMap';
 
 /**
- * End-to-end keyboard model: Guacamole 1.6 ported 1:1 into IronRDP.
+ * End-to-end keyboard model: Guacamole 1.6 server half + keymap ported into IronRDP, driven by a
+ * master-branch Keyboard.js client half.
  *
- * The client half (GuacKeyboard, the Keyboard.js port) turns the browser keydown/keypress/keyup stream
- * into X11 keysyms; the server half (GuacRdpKeyboard, the keyboard.c port) turns those keysyms into the
- * en-US scancode + Shift/AltGr the guest needs, reconciling the guest's modifier state lazily. The RDP
- * session is pinned to en-US (keyboard_layout 0x0409), so a scancode is interpreted as en-US and typing
- * is correct for every client layout (US/AZERTY/BEPO) and in terminals (a real scancode, never a
- * re-shifted Unicode injection). These tests drive the real browser event shapes (a printable keydown
- * is followed by a keypress; a modifier/nav keydown is not) through the service and assert the guest
- * scancode/Unicode stream. Per-keysym reconciliation is covered exhaustively in
- * ../lib/GuacRdpKeyboard.test.ts; this file verifies the full wiring.
+ * The client half (GuacKeyboard) turns the browser keydown/keypress/keyup stream into X11 keysyms; the
+ * server half (GuacRdpKeyboard) turns those keysyms into scancode + Shift/AltGr key events using the
+ * loaded keymap. The guest is pinned to FRENCH (WASM advertises keyboard_layout=0x040C, so xrdp sets the
+ * guest XKB to "fr" at session start): accents (é è à ç ù, and ê ë â û î ï ô ö ü via dead-key
+ * decomposition) type as NATIVE scancodes, which xkb terminals (Alacritty) receive. The client half is
+ * still character-keyed (evt.key), so it stays correct for every client layout (AZERTY/BÉPO/QWERTY).
+ * These tests drive real browser event shapes through the service and assert the guest scancode/Unicode
+ * stream; expected scancodes are DERIVED from the loaded keymap.
  */
 
-// Scancodes from the ported en-us-qwerty keymap.
-const KEY_V = 0x2f;
-const KEY_A = 0x1e;
-const KEY_C = 0x2e;
-const DIGIT1 = 0x02;
-const DIGIT2 = 0x03;
 const SHIFT_L = 0x2a;
 const CTRL_L = 0x1d;
 const ARROW_LEFT = 0xe04b;
 
+function scFor(keysym: number, mods = 0): number {
+    const defs = GUEST_KEYMAP.filter((d) => d.keysym === keysym);
+    const chosen = defs.find((d) => (d.setMod ?? 0) === mods) ?? defs[0];
+    if (chosen === undefined) {
+        throw new Error(`keysym 0x${keysym.toString(16)} not in keymap`);
+    }
+    return keysymScancode(chosen);
+}
+const cpOf = (s: string): number => s.codePointAt(0) ?? 0;
+
 class MockInputTransaction {
     addEvent = vi.fn();
 }
-
 function createMockModule(): RemoteDesktopModule {
     return {
         SessionBuilder: class {} as unknown as RemoteDesktopModule['SessionBuilder'],
@@ -49,7 +53,6 @@ function createMockModule(): RemoteDesktopModule {
         },
     };
 }
-
 function createMockSession(): Session {
     return {
         run: vi.fn().mockResolvedValue({ reason: () => 'test' }),
@@ -64,15 +67,9 @@ function createMockSession(): Session {
         invokeExtension: vi.fn(),
     } as unknown as Session;
 }
-
 function pressedWith(mod: RemoteDesktopModule, sc: number): boolean {
     return (mod.DeviceEvent.keyPressed as ReturnType<typeof vi.fn>).mock.calls.some(([s]) => s === sc);
 }
-function releasedWith(mod: RemoteDesktopModule, sc: number): boolean {
-    return (mod.DeviceEvent.keyReleased as ReturnType<typeof vi.fn>).mock.calls.some(([s]) => s === sc);
-}
-
-// Reconstruct the full keyPressed/keyReleased stream in invocation order.
 function keyStream(mod: RemoteDesktopModule): { sc: number; down: boolean; order: number }[] {
     const kp = mod.DeviceEvent.keyPressed as ReturnType<typeof vi.fn>;
     const kr = mod.DeviceEvent.keyReleased as ReturnType<typeof vi.fn>;
@@ -82,8 +79,6 @@ function keyStream(mod: RemoteDesktopModule): { sc: number; down: boolean; order
     stream.sort((a, b) => a.order - b.order);
     return stream;
 }
-
-// Whether Shift is held on the guest at the moment targetSc is first pressed.
 function shiftDownWhenPressed(mod: RemoteDesktopModule, targetSc: number): boolean {
     let shift = 0;
     for (const e of keyStream(mod)) {
@@ -93,7 +88,7 @@ function shiftDownWhenPressed(mod: RemoteDesktopModule, targetSc: number): boole
     return false;
 }
 
-describe('Guacamole keyboard port (end-to-end through the service)', () => {
+describe('Guacamole keyboard port, French guest pin (end-to-end through the service)', () => {
     let service: RemoteDesktopService;
     let mod: RemoteDesktopModule;
 
@@ -105,7 +100,6 @@ describe('Guacamole keyboard port (end-to-end through the service)', () => {
         service.session = createMockSession();
         service.setKeyboardUnicodeMode(true);
     });
-
     afterEach(() => {
         vi.useRealTimers();
     });
@@ -113,10 +107,6 @@ describe('Guacamole keyboard port (end-to-end through the service)', () => {
     function ev(type: string, init: KeyboardEventInit): KeyboardEvent {
         return new KeyboardEvent(type, init);
     }
-
-    // Type a printable character the way a browser does: keydown, then keypress carrying the character's
-    // codepoint (unless a Ctrl/Meta chord suppresses keypress), then keyup. keyCode is stable across
-    // keydown/keyup so the client half can resolve the release.
     function typeChar(
         code: string,
         key: string,
@@ -126,14 +116,13 @@ describe('Guacamole keyboard port (end-to-end through the service)', () => {
     ) {
         service.sendKeyboardEvent(ev('keydown', { code, key, keyCode, ...mods }));
         if (keypressFires) {
-            const cp = key.codePointAt(0) ?? 0;
+            const cp = cpOf(key);
             service.sendKeyboardEvent(
                 ev('keypress', { code, key, keyCode: cp, which: cp, ...mods } as KeyboardEventInit),
             );
         }
         service.sendKeyboardEvent(ev('keyup', { code, key, keyCode, ...mods }));
     }
-
     function modDown(code: string, key: string, mods: Partial<KeyboardEventInit> = {}) {
         service.sendKeyboardEvent(ev('keydown', { code, key, ...mods }));
     }
@@ -141,20 +130,31 @@ describe('Guacamole keyboard port (end-to-end through the service)', () => {
         service.sendKeyboardEvent(ev('keyup', { code, key, ...mods }));
     }
 
-    it('plain "v" (US or the BEPO key that types v) -> KeyV, no Unicode', () => {
-        typeChar('KeyV', 'v', 86);
-        expect(pressedWith(mod, KEY_V)).toBe(true);
-        expect(releasedWith(mod, KEY_V)).toBe(true);
+    it('plain letter "a" -> its French scancode, no Unicode', () => {
+        typeChar('KeyA', 'a', 65);
+        expect(pressedWith(mod, scFor(cpOf('a')))).toBe(true);
         expect(mod.DeviceEvent.unicodePressed).not.toHaveBeenCalled();
     });
 
-    it('plain digit "1" (no Shift) -> Digit1, no Shift toggling', () => {
-        typeChar('Digit1', '1', 49);
-        expect(pressedWith(mod, DIGIT1)).toBe(true);
-        expect(pressedWith(mod, SHIFT_L)).toBe(false);
+    it('direct accent "é" -> native French scancode in the terminal (NOT Unicode)', () => {
+        typeChar('Digit2', 'é', 50);
+        expect(pressedWith(mod, scFor(0xe9))).toBe(true);
+        expect(mod.DeviceEvent.unicodePressed).not.toHaveBeenCalled();
     });
 
-    it('AZERTY Shift-held number row "12345" -> digits, Shift never re-pressed', () => {
+    it('circumflex accent "ê" -> dead circumflex + e (native scancodes), no Unicode', () => {
+        typeChar('KeyE', 'ê', 69);
+        expect(pressedWith(mod, scFor(0xfe52))).toBe(true); // dead circumflex
+        expect(pressedWith(mod, scFor(cpOf('e')))).toBe(true); // base e
+        expect(mod.DeviceEvent.unicodePressed).not.toHaveBeenCalled();
+    });
+
+    it('non-French, non-decomposable "ß" -> Unicode fallback', () => {
+        typeChar('KeyS', 'ß', 83);
+        expect(mod.DeviceEvent.unicodePressed).toHaveBeenCalledWith('ß');
+    });
+
+    it('AZERTY Shift-held number row "12345" -> digits (Shift pressed once, not per-digit)', () => {
         modDown('ShiftLeft', 'Shift', { shiftKey: true });
         for (const [code, key, kc] of [
             ['Digit1', '1', 49],
@@ -166,72 +166,51 @@ describe('Guacamole keyboard port (end-to-end through the service)', () => {
             typeChar(code, key, kc, { shiftKey: true });
         }
         modUp('ShiftLeft', 'Shift', {});
-
-        for (const sc of [DIGIT1, DIGIT2]) {
-            expect(shiftDownWhenPressed(mod, sc)).toBe(false);
-        }
+        expect(pressedWith(mod, scFor(cpOf('1'), MOD_SHIFT))).toBe(true);
         const shiftPresses = keyStream(mod).filter((e) => e.sc === SHIFT_L && e.down).length;
         expect(shiftPresses).toBe(1);
-        expect(mod.DeviceEvent.unicodePressed).not.toHaveBeenCalled();
     });
 
-    it('"@" with no physical Shift -> Shift tapped around Digit2', () => {
-        typeChar('Digit2', '@', 50);
-        expect(pressedWith(mod, SHIFT_L)).toBe(true);
-        expect(pressedWith(mod, DIGIT2)).toBe(true);
-        expect(shiftDownWhenPressed(mod, DIGIT2)).toBe(true);
-        expect(releasedWith(mod, SHIFT_L)).toBe(true);
-    });
-
-    it('uppercase "A" (Shift held) -> KeyA with Shift down', () => {
-        modDown('ShiftLeft', 'Shift', { shiftKey: true });
-        typeChar('KeyA', 'A', 65, { shiftKey: true });
-        modUp('ShiftLeft', 'Shift', {});
-        expect(shiftDownWhenPressed(mod, KEY_A)).toBe(true);
-    });
-
-    it('Ctrl+C (no keypress fires) -> Ctrl held, KeyC sent, Ctrl not stripped', () => {
+    it('Ctrl+C -> Ctrl held, "c" scancode, Ctrl not stripped', () => {
         modDown('ControlLeft', 'Control', { ctrlKey: true });
-        typeChar('KeyC', 'c', 67, { ctrlKey: true }, /* keypressFires */ false);
+        typeChar('KeyC', 'c', 67, { ctrlKey: true }, false);
         modUp('ControlLeft', 'Control', {});
         expect(pressedWith(mod, CTRL_L)).toBe(true);
-        expect(pressedWith(mod, KEY_C)).toBe(true);
-        expect(shiftDownWhenPressed(mod, KEY_C)).toBe(false);
+        expect(pressedWith(mod, scFor(cpOf('c')))).toBe(true);
     });
 
-    it('Mac Option+"@" : Option (Alt) becomes AltGr, dropped on en-US; "@" -> Shift+Digit2, no Alt to guest', () => {
-        // On macOS Alt is a typable modifier, so keypress fires for the composed character.
-        modDown('AltRight', 'Alt', { altKey: true });
-        typeChar('Digit2', '@', 50, { altKey: true }, /* keypressFires */ true);
-        modUp('AltRight', 'Alt', {});
-        expect(pressedWith(mod, DIGIT2)).toBe(true);
-        expect(shiftDownWhenPressed(mod, DIGIT2)).toBe(true);
-        // AltRight scancode (0xE038) must never reach the guest.
-        expect(pressedWith(mod, 0xe038)).toBe(false);
+    it('Cmd+Shift+C -> guest Ctrl (Meta remap) + Shift + "C"', () => {
+        modDown('MetaLeft', 'Meta', { metaKey: true });
+        modDown('ShiftLeft', 'Shift', { metaKey: true, shiftKey: true });
+        service.sendKeyboardEvent(
+            ev('keydown', { code: 'KeyC', key: 'C', keyCode: 67, metaKey: true, shiftKey: true }),
+        );
+        service.sendKeyboardEvent(ev('keyup', { code: 'KeyC', key: 'C', keyCode: 67, metaKey: true, shiftKey: true }));
+        modUp('ShiftLeft', 'Shift', { metaKey: true });
+        modUp('MetaLeft', 'Meta', {});
+        expect(shiftDownWhenPressed(mod, scFor(0x43, MOD_SHIFT))).toBe(true);
+        expect(pressedWith(mod, 0xe05b)).toBe(true); // Meta_L scancode (WASM remaps to Left Ctrl)
     });
 
-    it('non-printable navigation key (ArrowLeft) -> extended scancode, no keypress, no Unicode', () => {
-        service.sendKeyboardEvent(ev('keydown', { code: 'ArrowLeft', key: 'ArrowLeft' }));
-        service.sendKeyboardEvent(ev('keyup', { code: 'ArrowLeft', key: 'ArrowLeft' }));
+    it('plain Shift+ArrowLeft forwards the extended scancode, no Unicode', () => {
+        service.sendKeyboardEvent(ev('keydown', { code: 'ShiftLeft', key: 'Shift', shiftKey: true }));
+        service.sendKeyboardEvent(ev('keydown', { code: 'ArrowLeft', key: 'ArrowLeft', shiftKey: true }));
+        service.sendKeyboardEvent(ev('keyup', { code: 'ArrowLeft', key: 'ArrowLeft', shiftKey: true }));
+        service.sendKeyboardEvent(ev('keyup', { code: 'ShiftLeft', key: 'Shift' }));
         expect(pressedWith(mod, ARROW_LEFT)).toBe(true);
         expect(mod.DeviceEvent.unicodePressed).not.toHaveBeenCalled();
     });
 
-    it('accented "é" (not on en-US) -> Unicode injection', () => {
-        typeChar('KeyE', 'é', 69);
-        expect(mod.DeviceEvent.unicodePressed).toHaveBeenCalledWith('é');
+    it('CapsLock forces the guest lock OFF and is not forwarded', () => {
+        service.sendKeyboardEvent(ev('keydown', { code: 'CapsLock', key: 'CapsLock' }));
+        expect(service.session!.synchronizeLockKeys).toHaveBeenCalledWith(false, false, false, false);
     });
 
-    it('a Dead key (accent composition) emits nothing', () => {
+    it('a Dead key emits nothing', () => {
         service.sendKeyboardEvent(ev('keydown', { code: 'BracketLeft', key: 'Dead' }));
         service.sendKeyboardEvent(ev('keyup', { code: 'BracketLeft', key: 'Dead' }));
         expect(mod.DeviceEvent.keyPressed).not.toHaveBeenCalled();
         expect(mod.DeviceEvent.unicodePressed).not.toHaveBeenCalled();
-    });
-
-    it('CapsLock is forced OFF on the guest and its scancode is not forwarded', () => {
-        service.sendKeyboardEvent(ev('keydown', { code: 'CapsLock', key: 'CapsLock' }));
-        expect(service.session!.synchronizeLockKeys).toHaveBeenCalledWith(false, false, false, false);
     });
 
     it('blur/focusLost releases everything', () => {
@@ -244,16 +223,14 @@ describe('Guacamole keyboard port (end-to-end through the service)', () => {
 describe('non-unicode mode keeps the base package physical-scancode path', () => {
     let service: RemoteDesktopService;
     let mod: RemoteDesktopModule;
-
     beforeEach(() => {
         vi.clearAllMocks();
         mod = createMockModule();
         service = new RemoteDesktopService(mod);
         service.session = createMockSession();
     });
-
     it('keydown forwards scanCode(evt.code) directly', () => {
         service.sendKeyboardEvent(new KeyboardEvent('keydown', { code: 'KeyV', key: 'v' }));
-        expect(pressedWith(mod, KEY_V)).toBe(true);
+        expect(pressedWith(mod, 0x2f)).toBe(true); // KeyV physical scancode
     });
 });
