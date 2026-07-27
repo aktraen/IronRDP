@@ -98,10 +98,15 @@ export class ClipboardService {
         //    the polling loop unusable. Downgrade to TextOnly so Firefox
         //    routes through the text-only fallback paths.
         //
-        //    When the permission query fails, a trial clipboard.read() checks
-        //    whether Firefox's `dom.events.testing.asyncClipboard` about:config
-        //    pref is active. If so, keep Full mode as clipboard works fully in
-        //    this scenario, without any user-activation restrictions.
+        //    The rejection itself is the downgrade signal. There is deliberately
+        //    NO trial clipboard.read() here: that read is page-initiated, and
+        //    inside a transient-activation window Firefox answers it with its
+        //    ephemeral "Paste" context menu, which grabs the keyboard from the
+        //    session. A component that remounts (resize, reconnect) re-runs
+        //    initClipboard and pops the menu again, so the trainee sees "Paste"
+        //    over and over while typing. The only thing the probe bought was
+        //    detection of Firefox's `dom.events.testing.asyncClipboard` test
+        //    pref, which is off by default and not worth that cost.
         if (this.ClipboardApiSupported === ClipboardApiSupported.Full) {
             try {
                 const permissionStatus = await navigator.permissions.query({
@@ -112,12 +117,7 @@ export class ClipboardService {
                     this.ClipboardApiSupported = ClipboardApiSupported.TextOnly;
                 }
             } catch {
-                try {
-                    // Try to read clipboard to check if the asyncClipboard pref is enabled
-                    await navigator.clipboard.read();
-                } catch {
-                    this.ClipboardApiSupported = ClipboardApiSupported.TextOnly;
-                }
+                this.ClipboardApiSupported = ClipboardApiSupported.TextOnly;
             }
         }
 
