@@ -5,23 +5,35 @@ import type { Session } from '../interfaces/Session';
 import { scanCode } from '../lib/scancodes';
 
 /**
- * Regression tests for layout-dependent keyboard shortcuts.
+ * Keyboard model: Guacamole's "always right" approach, ported to IronRDP.
  *
- * Bug: sendKeyboard resolved shortcut scancodes from evt.code (the PHYSICAL key
- * position), so Ctrl+V only pasted when the physical QWERTY-V key was pressed.
- * On BEPO/AZERTY the key that TYPES "v" sits elsewhere, so the shortcut sent the
- * wrong scancode and did not paste. Guacamole keys off the character (keysym),
- * which is layout-independent.
+ * The RDP session is pinned to en-US-QWERTY (keyboard_layout 0x0409 in the WASM connector), so the
+ * guest interprets every scancode as en-US. sendKeyboard keys on the CHARACTER the user meant
+ * (KeyboardEvent.key, already resolved through the client's own layout) and sends the en-US scancode +
+ * Shift that PRODUCES that character (usKeymap.ts), juggling modifiers guacd-style: clear interfering
+ * ones, set exactly the Shift the character needs, restore. Because it keys on the resulting character,
+ * it is correct for every client layout (US/AZERTY/BEPO/QWERTZ) and, unlike a Unicode-keysym injection,
+ * correct in terminals (a real scancode the guest resolves natively, never re-shifted).
  *
- * Fix: when a modifier is held (sendAsUnicode === false) and the key is a letter,
- * derive the scancode from evt.key (the character) as `Key<UPPER>` instead of
- * evt.code. Plain typing (no modifier) keeps the unicode path untouched.
+ * These tests replace the earlier per-layout scancode hacks (physical-code shortcuts, digit-scancode,
+ * Unicode-with-Shift-release) which were layout-specific and broke on non-US clients.
  */
 
-const V = scanCode('KeyV');
-const H = scanCode('KeyH');
-const A = scanCode('KeyA');
-const Q = scanCode('KeyQ');
+const KEY_V = scanCode('KeyV');
+const KEY_C = scanCode('KeyC');
+const KEY_A = scanCode('KeyA');
+const KEY_T = scanCode('KeyT');
+const DIGIT1 = scanCode('Digit1');
+const DIGIT2 = scanCode('Digit2');
+const DIGIT3 = scanCode('Digit3');
+const SLASH = scanCode('Slash');
+const SHIFT_L = scanCode('ShiftLeft');
+const SHIFT_R = scanCode('ShiftRight');
+const CTRL_L = scanCode('ControlLeft');
+const CTRL_R = scanCode('ControlRight');
+const ALT_L = scanCode('AltLeft');
+const ALT_R = scanCode('AltRight');
+const ARROW_LEFT = scanCode('ArrowLeft');
 
 class MockInputTransaction {
     addEvent = vi.fn();
@@ -61,7 +73,14 @@ function createMockSession(): Session {
     } as unknown as Session;
 }
 
-describe('layout-independent keyboard shortcuts', () => {
+function pressedWith(mod: RemoteDesktopModule, sc: number): boolean {
+    return (mod.DeviceEvent.keyPressed as ReturnType<typeof vi.fn>).mock.calls.some(([s]) => s === sc);
+}
+function releasedWith(mod: RemoteDesktopModule, sc: number): boolean {
+    return (mod.DeviceEvent.keyReleased as ReturnType<typeof vi.fn>).mock.calls.some(([s]) => s === sc);
+}
+
+describe('US-keymap character production (Guacamole model)', () => {
     let service: RemoteDesktopService;
     let mod: RemoteDesktopModule;
 
@@ -76,275 +95,347 @@ describe('layout-independent keyboard shortcuts', () => {
     function key(code: string, k: string, mods: Partial<KeyboardEventInit> = {}) {
         service.sendKeyboardEvent(new KeyboardEvent('keydown', { code, key: k, ...mods }));
     }
-
-    it('sanity: getModifierState honours ctrlKey under jsdom', () => {
-        expect(new KeyboardEvent('keydown', { ctrlKey: true }).getModifierState('Control')).toBe(true);
-        expect(V).toBe(0x2f);
-        expect(H).toBe(0x23);
-    });
-
-    it('BEPO: Ctrl + (physical H key that types "v") sends the V scancode, not H', () => {
-        key('KeyH', 'v', { ctrlKey: true });
-        expect(mod.DeviceEvent.keyPressed).toHaveBeenCalledWith(V);
-        expect(mod.DeviceEvent.keyPressed).not.toHaveBeenCalledWith(H);
-    });
-
-    it('QWERTY: Ctrl + V still sends the V scancode', () => {
-        key('KeyV', 'v', { ctrlKey: true });
-        expect(mod.DeviceEvent.keyPressed).toHaveBeenCalledWith(V);
-    });
-
-    it('AZERTY: Ctrl + (physical Q key that types "a") sends the A scancode, not Q', () => {
-        key('KeyQ', 'a', { ctrlKey: true });
-        expect(mod.DeviceEvent.keyPressed).toHaveBeenCalledWith(A);
-        expect(mod.DeviceEvent.keyPressed).not.toHaveBeenCalledWith(Q);
-    });
-
-    it('Meta (Mac Command) held is treated as a shortcut too', () => {
-        key('KeyH', 'v', { metaKey: true });
-        expect(mod.DeviceEvent.keyPressed).toHaveBeenCalledWith(V);
-    });
-
-    it('uppercase character (Shift held) still resolves to the letter scancode', () => {
-        key('KeyH', 'V', { ctrlKey: true, shiftKey: true });
-        expect(mod.DeviceEvent.keyPressed).toHaveBeenCalledWith(V);
-    });
-
-    it('plain typing (no modifier) is unchanged: sends unicode, not a scancode', () => {
-        key('KeyH', 'v');
-        expect(mod.DeviceEvent.unicodePressed).toHaveBeenCalledWith('v');
-        expect(mod.DeviceEvent.keyPressed).not.toHaveBeenCalled();
-    });
-
-    it('non-letter shortcut (Ctrl+1) is left on the physical-code path', () => {
-        key('Digit1', '1', { ctrlKey: true });
-        expect(mod.DeviceEvent.keyPressed).toHaveBeenCalledWith(scanCode('Digit1'));
-    });
-});
-
-describe('AltGr-composed characters (BEPO / AZERTY typing of / { } | @ ...)', () => {
-    let service: RemoteDesktopService;
-    let mod: RemoteDesktopModule;
-
-    const CTRL_L = scanCode('ControlLeft');
-    const CTRL_R = scanCode('ControlRight');
-    const ALT_L = scanCode('AltLeft');
-    const ALT_R = scanCode('AltRight');
-
-    beforeEach(() => {
+    function seedShift(side: 'ShiftLeft' | 'ShiftRight' = 'ShiftLeft') {
+        service.sendKeyboardEvent(new KeyboardEvent('keydown', { code: side, key: 'Shift', shiftKey: true }));
         vi.clearAllMocks();
-        mod = createMockModule();
-        service = new RemoteDesktopService(mod);
-        service.session = createMockSession();
-        service.setKeyboardUnicodeMode(true);
-    });
-
-    function key(code: string, k: string, mods: Partial<KeyboardEventInit> = {}) {
-        service.sendKeyboardEvent(new KeyboardEvent('keydown', { code, key: k, ...mods }));
     }
 
-    it('Windows AltGr (Ctrl+Alt) + "/" types "/" as Unicode and releases Ctrl+Alt first', () => {
-        key('Digit3', '/', { ctrlKey: true, altKey: true });
-        expect(mod.DeviceEvent.unicodePressed).toHaveBeenCalledWith('/');
-        expect(mod.DeviceEvent.keyReleased).toHaveBeenCalledWith(CTRL_L);
-        expect(mod.DeviceEvent.keyReleased).toHaveBeenCalledWith(CTRL_R);
-        expect(mod.DeviceEvent.keyReleased).toHaveBeenCalledWith(ALT_L);
-        expect(mod.DeviceEvent.keyReleased).toHaveBeenCalledWith(ALT_R);
-        expect(mod.DeviceEvent.keyPressed).not.toHaveBeenCalled();
-    });
-
-    it('Mac right-Option (altKey only) + "/" also types "/" as Unicode', () => {
-        key('Slash', '/', { altKey: true });
-        expect(mod.DeviceEvent.unicodePressed).toHaveBeenCalledWith('/');
-        expect(mod.DeviceEvent.keyReleased).toHaveBeenCalledWith(ALT_R);
-        expect(mod.DeviceEvent.keyPressed).not.toHaveBeenCalled();
-    });
-
-    it('AltGr + "€" (multi-byte) types the euro sign as Unicode', () => {
-        key('KeyE', '€', { ctrlKey: true, altKey: true });
-        expect(mod.DeviceEvent.unicodePressed).toHaveBeenCalledWith('€');
-        expect(mod.DeviceEvent.keyPressed).not.toHaveBeenCalled();
-    });
-
-    it('Ctrl+Alt+<letter> stays a shortcut (letters never need AltGr)', () => {
-        key('KeyT', 't', { ctrlKey: true, altKey: true });
-        expect(mod.DeviceEvent.keyPressed).toHaveBeenCalledWith(scanCode('KeyT'));
-        expect(mod.DeviceEvent.unicodePressed).not.toHaveBeenCalled();
-    });
-
-    it('Ctrl+"/" (no Alt) stays a shortcut on the scancode path', () => {
-        key('Slash', '/', { ctrlKey: true });
-        expect(mod.DeviceEvent.keyPressed).toHaveBeenCalledWith(scanCode('Slash'));
-        expect(mod.DeviceEvent.unicodePressed).not.toHaveBeenCalled();
-    });
-
-    it('Meta+"/" (Command shortcut) is not treated as composition', () => {
-        key('Slash', '/', { metaKey: true });
-        expect(mod.DeviceEvent.unicodePressed).not.toHaveBeenCalled();
-    });
-});
-
-/**
- * Regression tests for the BEPO Shift+number-row bug (founder-reported).
- *
- * Bug: on a BEPO layout the number row's SHIFTED level types the DIGITS
- * 1234567890, but the physical Shift keydown is forwarded to the guest as a Shift
- * SCANCODE that stays held while the digit is injected as a Unicode character.
- * The guest re-applies Shift to that injection and yields the guest-layout shifted
- * symbol (!@#$%^&*() on a US guest) instead of the digit. Unshifted typing works
- * (no Shift held), and Shift+letter looks fine (uppercase keysym is unchanged by
- * Shift), which is exactly what the founder observed.
- *
- * Fix: mirror Guacamole's release_simulated_altgr. When a printable character is
- * sent as Unicode while Shift is physically held, release the held Shift
- * scancode(s) BEFORE the character and re-press them AFTER, so the guest sees a
- * clean Unicode injection yet Shift stays held for subsequent Shift+navigation
- * (text selection). Only the Shift key(s) actually down (tracked in
- * modifierKeyPressed) are toggled, so a Shift that was never pressed is never
- * stranded.
- */
-describe('Shift neutralization around Unicode characters (BEPO Shift+number row)', () => {
-    let service: RemoteDesktopService;
-    let mod: RemoteDesktopModule;
-
-    const SHIFT_L = scanCode('ShiftLeft');
-    const SHIFT_R = scanCode('ShiftRight');
-    const ARROW_LEFT = scanCode('ArrowLeft');
-
-    beforeEach(() => {
-        vi.clearAllMocks();
-        mod = createMockModule();
-        service = new RemoteDesktopService(mod);
-        service.session = createMockSession();
-        service.setKeyboardUnicodeMode(true);
-    });
-
-    function press(code: string, k: string, mods: Partial<KeyboardEventInit> = {}) {
-        service.sendKeyboardEvent(new KeyboardEvent('keydown', { code, key: k, ...mods }));
-    }
-
-    it('sanity: Shift scancodes resolve', () => {
+    it('sanity: distinct scancodes resolve', () => {
+        expect(KEY_V).toBe(0x2f);
+        expect(DIGIT1).toBe(0x02);
         expect(SHIFT_L).toBe(0x2a);
-        expect(SHIFT_R).toBe(0x36);
     });
 
-    it('BEPO Shift+Digit1 types "1" as Unicode with ShiftLeft released before and re-pressed after', () => {
-        press('ShiftLeft', 'Shift', { shiftKey: true });
-        vi.clearAllMocks();
+    it('plain letter "v" sends the KeyV scancode (no Unicode)', () => {
+        key('KeyV', 'v');
+        expect(mod.DeviceEvent.keyPressed).toHaveBeenCalledWith(KEY_V);
+        expect(mod.DeviceEvent.unicodePressed).not.toHaveBeenCalled();
+    });
 
-        press('Digit1', '1', { shiftKey: true });
+    it('BEPO: the physical H key that TYPES "v" still sends KeyV (keys on the character, not position)', () => {
+        key('KeyH', 'v');
+        expect(mod.DeviceEvent.keyPressed).toHaveBeenCalledWith(KEY_V);
+        expect(pressedWith(mod, scanCode('KeyH'))).toBe(false);
+    });
 
+    it('plain digit "1" (US client, no Shift) sends Digit1, no Shift toggling', () => {
+        key('Digit1', '1');
+        expect(mod.DeviceEvent.keyPressed).toHaveBeenCalledWith(DIGIT1);
+        expect(mod.DeviceEvent.unicodePressed).not.toHaveBeenCalled();
+        expect(releasedWith(mod, SHIFT_L)).toBe(false);
+    });
+
+    it('BEPO/AZERTY Shift+digit -> "1": Shift released BEFORE the digit and NOT re-pressed (terminal-safe; the reported bug)', () => {
+        seedShift();
+        key('Digit1', '1', { shiftKey: true });
+
+        // The character is "1" (US: Digit1, NO shift), but Shift is physically held to reach it on
+        // BEPO/AZERTY. Release the held Shift so the guest resolves Digit1 -> "1", then LEAVE Shift
+        // released. Re-pressing it in the same batch bracketed the digit with a phantom Shift release +
+        // Shift re-press; a terminal that honours the live modifier stream (CSI-u / modifyOtherKeys /
+        // the kitty keyboard protocol) then reports spurious Shift toggles around every digit -- so
+        // digits "don't come out right" in the terminal even though GUI toolkits tolerate it. Guacamole's
+        // model: never restore a modifier around a key; reconcile it lazily on the next key.
         expect(mod.DeviceEvent.keyReleased).toHaveBeenCalledWith(SHIFT_L);
-        expect(mod.DeviceEvent.unicodePressed).toHaveBeenCalledWith('1');
-        expect(mod.DeviceEvent.keyPressed).toHaveBeenCalledWith(SHIFT_L);
+        expect(mod.DeviceEvent.keyPressed).toHaveBeenCalledWith(DIGIT1);
+        expect(pressedWith(mod, SHIFT_L)).toBe(false); // NOT re-pressed -> no phantom Shift toggle
+        expect(mod.DeviceEvent.unicodePressed).not.toHaveBeenCalled();
 
-        // Order must be: release Shift -> inject char -> re-press Shift.
+        // Order: release Shift BEFORE tapping Digit1 (so the guest sees Digit1 with no Shift).
+        const kp = mod.DeviceEvent.keyPressed as ReturnType<typeof vi.fn>;
         const relOrder = (mod.DeviceEvent.keyReleased as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
-        const uniOrder = (mod.DeviceEvent.unicodePressed as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
-        const preOrder = (mod.DeviceEvent.keyPressed as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
-        expect(relOrder).toBeLessThan(uniOrder);
-        expect(uniOrder).toBeLessThan(preOrder);
+        const digitIdx = kp.mock.calls.findIndex(([sc]) => sc === DIGIT1);
+        expect(relOrder).toBeLessThan(kp.mock.invocationCallOrder[digitIdx]);
     });
 
-    it('no net Shift dangling: exactly one release and one matching re-press of the held Shift', () => {
-        press('ShiftLeft', 'Shift', { shiftKey: true });
-        vi.clearAllMocks();
-
-        press('Digit5', '5', { shiftKey: true });
-
-        const releasedShift = (mod.DeviceEvent.keyReleased as ReturnType<typeof vi.fn>).mock.calls.filter(
-            ([sc]) => sc === SHIFT_L,
-        );
-        const pressedShift = (mod.DeviceEvent.keyPressed as ReturnType<typeof vi.fn>).mock.calls.filter(
-            ([sc]) => sc === SHIFT_L,
-        );
-        expect(releasedShift).toHaveLength(1);
-        expect(pressedShift).toHaveLength(1);
+    it('CONTINUOUS Shift-hold across the number row (1..0) never re-presses Shift -> no shifted-symbol corruption', () => {
+        // The reported bug's real shape: an AZERTY/BEPO typist holds Shift ONCE and taps the whole number
+        // row (digits live on the Shift layer), with NO Shift keyup between digits. The old else-branch
+        // re-pressed Shift after EVERY digit, so between consecutive digits the guest held Shift down again
+        // -- a terminal (Alacritty/winit) that reads the live modifier when the next Digit scancode lands
+        // then rendered the US SHIFTED SYMBOL (1->!, 2->@, ...). With the lazy-state fix the held Shift is
+        // released once, BEFORE the first digit, and never re-pressed: across the entire run Shift is only
+        // ever released, so no digit is ever adjacent to a Shift-down state and the symbols cannot appear.
+        seedShift();
+        const row = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0'] as const;
+        for (const d of row) {
+            key('Digit' + (d === '0' ? '0' : d), d, { shiftKey: true });
+        }
+        for (const d of row) {
+            expect(mod.DeviceEvent.keyPressed).toHaveBeenCalledWith(scanCode('Digit' + (d === '0' ? '0' : d)));
+        }
+        // The invariant that kills the corruption: Shift is NEVER pressed by the character path.
+        expect(pressedWith(mod, SHIFT_L)).toBe(false);
+        expect(pressedWith(mod, SHIFT_R)).toBe(false);
+        expect(mod.DeviceEvent.unicodePressed).not.toHaveBeenCalled();
     });
 
-    it('restores only the Shift actually held: ShiftLeft down does not touch ShiftRight', () => {
-        press('ShiftLeft', 'Shift', { shiftKey: true });
-        vi.clearAllMocks();
-
-        press('Digit2', '2', { shiftKey: true });
-
-        expect(mod.DeviceEvent.keyReleased).not.toHaveBeenCalledWith(SHIFT_R);
-        expect(mod.DeviceEvent.keyPressed).not.toHaveBeenCalledWith(SHIFT_R);
+    it('US "!" (Shift held, char NEEDS shift): Digit1 sent WITH Shift, no toggling', () => {
+        seedShift();
+        key('Digit1', '!', { shiftKey: true });
+        expect(mod.DeviceEvent.keyPressed).toHaveBeenCalledWith(DIGIT1);
+        // Shift is already what the char needs, so it is never released around the key.
+        expect(releasedWith(mod, SHIFT_L)).toBe(false);
+        expect(mod.DeviceEvent.unicodePressed).not.toHaveBeenCalled();
     });
 
-    it('ShiftRight held neutralizes ShiftRight (not ShiftLeft)', () => {
-        press('ShiftRight', 'Shift', { shiftKey: true });
-        vi.clearAllMocks();
-
-        press('Digit3', '3', { shiftKey: true });
-
-        expect(mod.DeviceEvent.keyReleased).toHaveBeenCalledWith(SHIFT_R);
-        expect(mod.DeviceEvent.keyPressed).toHaveBeenCalledWith(SHIFT_R);
-        expect(mod.DeviceEvent.keyReleased).not.toHaveBeenCalledWith(SHIFT_L);
-    });
-
-    it('Shift+letter still types the uppercase letter (as Unicode), Shift neutralized around it', () => {
-        press('ShiftLeft', 'Shift', { shiftKey: true });
-        vi.clearAllMocks();
-
-        press('KeyV', 'V', { shiftKey: true });
-
-        expect(mod.DeviceEvent.unicodePressed).toHaveBeenCalledWith('V');
-        expect(mod.DeviceEvent.keyReleased).toHaveBeenCalledWith(SHIFT_L);
+    it('char needs Shift but none held -> ShiftLeft tapped around the key ("@" with no physical Shift)', () => {
+        key('Digit2', '@');
         expect(mod.DeviceEvent.keyPressed).toHaveBeenCalledWith(SHIFT_L);
+        expect(mod.DeviceEvent.keyPressed).toHaveBeenCalledWith(DIGIT2);
+        expect(mod.DeviceEvent.keyReleased).toHaveBeenCalledWith(SHIFT_L);
+        // Shift is pressed BEFORE and released AFTER the digit.
+        const kp = mod.DeviceEvent.keyPressed as ReturnType<typeof vi.fn>;
+        const kr = mod.DeviceEvent.keyReleased as ReturnType<typeof vi.fn>;
+        const shiftDownIdx = kp.mock.calls.findIndex(([sc]) => sc === SHIFT_L);
+        const digitDownIdx = kp.mock.calls.findIndex(([sc]) => sc === DIGIT2);
+        const shiftUpIdx = kr.mock.calls.findIndex(([sc]) => sc === SHIFT_L);
+        expect(kp.mock.invocationCallOrder[shiftDownIdx]).toBeLessThan(kp.mock.invocationCallOrder[digitDownIdx]);
+        expect(kp.mock.invocationCallOrder[digitDownIdx]).toBeLessThan(kr.mock.invocationCallOrder[shiftUpIdx]);
     });
 
-    it('Shift+ArrowLeft (text selection) still sends the Arrow scancode with Shift held', () => {
-        press('ShiftLeft', 'Shift', { shiftKey: true });
-        // Type a shifted digit first: Shift is released then RESTORED, so it stays held.
-        press('Digit1', '1', { shiftKey: true });
+    it('uppercase "A" (Shift held): KeyA sent with Shift, no toggling', () => {
+        seedShift();
+        key('KeyA', 'A', { shiftKey: true });
+        expect(mod.DeviceEvent.keyPressed).toHaveBeenCalledWith(KEY_A);
+        expect(releasedWith(mod, SHIFT_L)).toBe(false);
+    });
+
+    it('printable char is atomic on keydown; keyup sends nothing', () => {
+        service.sendKeyboardEvent(new KeyboardEvent('keyup', { code: 'KeyV', key: 'v' }));
+        expect(mod.DeviceEvent.keyPressed).not.toHaveBeenCalled();
+        expect(mod.DeviceEvent.keyReleased).not.toHaveBeenCalled();
+        expect(mod.DeviceEvent.unicodePressed).not.toHaveBeenCalled();
+    });
+});
+
+describe('modifiers and command shortcuts (kept universal)', () => {
+    let service: RemoteDesktopService;
+    let mod: RemoteDesktopModule;
+
+    beforeEach(() => {
         vi.clearAllMocks();
+        mod = createMockModule();
+        service = new RemoteDesktopService(mod);
+        service.session = createMockSession();
+        service.setKeyboardUnicodeMode(true);
+    });
+    function key(code: string, k: string, mods: Partial<KeyboardEventInit> = {}) {
+        service.sendKeyboardEvent(new KeyboardEvent('keydown', { code, key: k, ...mods }));
+    }
 
-        press('ArrowLeft', 'ArrowLeft', { shiftKey: true });
+    it('Ctrl+C on any layout -> KeyC (Ctrl is held by its own event, never stripped)', () => {
+        key('KeyC', 'c', { ctrlKey: true });
+        expect(mod.DeviceEvent.keyPressed).toHaveBeenCalledWith(KEY_C);
+        expect(releasedWith(mod, CTRL_L)).toBe(false);
+        expect(releasedWith(mod, CTRL_R)).toBe(false);
+    });
 
-        // Navigation goes via scancode (not Unicode), so the guest's still-held Shift selects.
+    it('BEPO: Ctrl + (physical J that types "c") still pastes-family -> KeyC (character-keyed)', () => {
+        key('KeyJ', 'c', { ctrlKey: true });
+        expect(mod.DeviceEvent.keyPressed).toHaveBeenCalledWith(KEY_C);
+    });
+
+    it('Ctrl+Shift+V (terminal paste) -> KeyV with Shift kept', () => {
+        key('KeyV', 'V', { ctrlKey: true, shiftKey: true });
+        expect(mod.DeviceEvent.keyPressed).toHaveBeenCalledWith(KEY_V);
+        expect(releasedWith(mod, SHIFT_L)).toBe(false);
+    });
+
+    it('the Shift modifier key itself is forwarded as a scancode and tracked', () => {
+        key('ShiftLeft', 'Shift', { shiftKey: true });
+        expect(mod.DeviceEvent.keyPressed).toHaveBeenCalledWith(SHIFT_L);
+        expect(service.modifierKeyPressed).toContain('ShiftLeft');
+    });
+
+    it('non-printable navigation key (ArrowLeft) forwards its physical scancode', () => {
+        key('ArrowLeft', 'ArrowLeft', { shiftKey: true });
         expect(mod.DeviceEvent.keyPressed).toHaveBeenCalledWith(ARROW_LEFT);
         expect(mod.DeviceEvent.unicodePressed).not.toHaveBeenCalled();
     });
 
-    it('plain digit typing (no Shift) is unchanged: pure Unicode, no Shift toggling', () => {
-        press('Digit1', '1');
-
-        expect(mod.DeviceEvent.unicodePressed).toHaveBeenCalledWith('1');
-        expect(mod.DeviceEvent.keyReleased).not.toHaveBeenCalled();
-        expect(mod.DeviceEvent.keyPressed).not.toHaveBeenCalled();
+    it('Ctrl+Alt+<letter> stays a command chord (letters never AltGr) -> KeyT, modifiers kept', () => {
+        key('KeyT', 't', { ctrlKey: true, altKey: true });
+        expect(mod.DeviceEvent.keyPressed).toHaveBeenCalledWith(KEY_T);
+        expect(releasedWith(mod, CTRL_L)).toBe(false);
+        expect(releasedWith(mod, ALT_L)).toBe(false);
     });
+});
 
-    it('Ctrl+Alt+Shift AltGr composition path is unaffected by Shift neutralization', () => {
-        // AltGr-composed non-letter still goes through the composed-char branch (Ctrl/Alt released,
-        // char as Unicode) regardless of the new Shift handling.
-        press('Digit3', '/', { ctrlKey: true, altKey: true });
-        expect(mod.DeviceEvent.unicodePressed).toHaveBeenCalledWith('/');
-    });
+describe('AltGr-composed characters (BEPO/AZERTY / { } | @ # ...)', () => {
+    let service: RemoteDesktopService;
+    let mod: RemoteDesktopModule;
 
-    it('does NOT strand Shift when the mirror is stale but Shift is not really held (no re-press)', () => {
-        // A lone Shift keyup (focus gained mid-hold) pushes a PHANTOM ShiftLeft into
-        // modifierKeyPressed while the guest's Shift is UP. Typing a char with Shift not actually
-        // held must NOT release/re-press Shift (a re-press would strand Shift down on the guest and
-        // shift every subsequent key). The neutralization is gated on the event's own evt.shiftKey,
-        // so with the phantom present but evt.shiftKey === false, no Shift toggling occurs.
-        service.sendKeyboardEvent(new KeyboardEvent('keyup', { code: 'ShiftLeft', key: 'Shift' }));
-        expect(service.modifierKeyPressed).toContain('ShiftLeft'); // phantom seeded
+    beforeEach(() => {
         vi.clearAllMocks();
+        mod = createMockModule();
+        service = new RemoteDesktopService(mod);
+        service.session = createMockSession();
+        service.setKeyboardUnicodeMode(true);
+    });
+    function down(code: string, k: string, mods: Partial<KeyboardEventInit> = {}) {
+        service.sendKeyboardEvent(new KeyboardEvent('keydown', { code, key: k, ...mods }));
+    }
+    // Windows AltGr = a synthetic LeftControl keydown + a RightAlt keydown. Seeding these populates the
+    // modifier mirror the way the real event stream does, so the strip releases the ACTUAL held sides.
+    function seedWinAltGr() {
+        down('ControlLeft', 'Control', { ctrlKey: true });
+        down('AltRight', 'Alt', { ctrlKey: true, altKey: true });
+        vi.clearAllMocks();
+    }
 
-        press('KeyA', 'a'); // evt.shiftKey defaults to false
-
-        expect(mod.DeviceEvent.unicodePressed).toHaveBeenCalledWith('a');
-        expect(mod.DeviceEvent.keyPressed).not.toHaveBeenCalled();
-        expect(mod.DeviceEvent.keyReleased).not.toHaveBeenCalled();
+    it('Windows AltGr + "/" -> Slash scancode; strips ONLY the held sides (CTRL_L, ALT_R) and restores them; CTRL_R/ALT_L never touched (B1)', () => {
+        seedWinAltGr();
+        down('Digit3', '/', { ctrlKey: true, altKey: true });
+        expect(mod.DeviceEvent.keyPressed).toHaveBeenCalledWith(SLASH);
+        expect(mod.DeviceEvent.keyReleased).toHaveBeenCalledWith(CTRL_L);
+        expect(mod.DeviceEvent.keyReleased).toHaveBeenCalledWith(ALT_R);
+        expect(mod.DeviceEvent.keyPressed).toHaveBeenCalledWith(CTRL_L); // restored
+        expect(mod.DeviceEvent.keyPressed).toHaveBeenCalledWith(ALT_R); // restored
+        // The un-held sides must NEVER be released OR pressed (re-pressing them strands them down).
+        expect(releasedWith(mod, CTRL_R)).toBe(false);
+        expect(pressedWith(mod, CTRL_R)).toBe(false);
+        expect(releasedWith(mod, ALT_L)).toBe(false);
+        expect(pressedWith(mod, ALT_L)).toBe(false);
+        expect(mod.DeviceEvent.unicodePressed).not.toHaveBeenCalled();
     });
 
-    it('releaseAllInputs (blur/focusLost/mouseOut) resets the modifier mirror', () => {
-        press('ShiftLeft', 'Shift', { shiftKey: true });
+    it('Mac right-Option + "/" -> Slash scancode; only ALT_R toggled', () => {
+        down('AltRight', 'Alt', { altKey: true });
+        vi.clearAllMocks();
+        down('Slash', '/', { altKey: true });
+        expect(mod.DeviceEvent.keyPressed).toHaveBeenCalledWith(SLASH);
+        expect(mod.DeviceEvent.keyReleased).toHaveBeenCalledWith(ALT_R);
+        expect(mod.DeviceEvent.keyPressed).toHaveBeenCalledWith(ALT_R);
+        expect(releasedWith(mod, ALT_L)).toBe(false);
+        expect(releasedWith(mod, CTRL_L)).toBe(false);
+    });
+
+    it('AltGr char that NEEDS shift on US ("#" = Shift+Digit3): held Ctrl/Alt stripped AND Shift tapped', () => {
+        seedWinAltGr();
+        down('Digit3', '#', { ctrlKey: true, altKey: true });
+        expect(mod.DeviceEvent.keyReleased).toHaveBeenCalledWith(CTRL_L);
+        expect(mod.DeviceEvent.keyReleased).toHaveBeenCalledWith(ALT_R);
+        expect(mod.DeviceEvent.keyPressed).toHaveBeenCalledWith(SHIFT_L);
+        expect(mod.DeviceEvent.keyPressed).toHaveBeenCalledWith(DIGIT3);
+        expect(releasedWith(mod, ALT_L)).toBe(false);
+    });
+
+    it('Ctrl+"/" (no Alt) stays a command chord -> Slash, Ctrl kept', () => {
+        down('ControlLeft', 'Control', { ctrlKey: true });
+        vi.clearAllMocks();
+        down('Slash', '/', { ctrlKey: true });
+        expect(mod.DeviceEvent.keyPressed).toHaveBeenCalledWith(SLASH);
+        expect(releasedWith(mod, CTRL_L)).toBe(false);
+    });
+});
+
+describe('CapsLock: case comes from the character, not the guest lock (M2)', () => {
+    let service: RemoteDesktopService;
+    let mod: RemoteDesktopModule;
+
+    beforeEach(() => {
+        vi.clearAllMocks();
+        mod = createMockModule();
+        service = new RemoteDesktopService(mod);
+        service.session = createMockSession();
+        service.setKeyboardUnicodeMode(true);
+    });
+
+    it('CapsLock keydown forces the guest lock OFF (sync arg false) and does NOT forward a scancode', () => {
+        service.sendKeyboardEvent(new KeyboardEvent('keydown', { code: 'CapsLock', key: 'CapsLock' }));
+        // synchronizeLockKeys(scroll, num, caps, kana) -> caps (3rd) must be false so the guest never
+        // double-applies case on top of the explicit Shift the character model sends for capitals.
+        expect(service.session!.synchronizeLockKeys).toHaveBeenCalledWith(false, false, false, false);
+        // The CapsLock scancode is NOT forwarded (would toggle the guest lock and fight the sync).
+        expect(mod.DeviceEvent.keyPressed).not.toHaveBeenCalled();
+    });
+});
+
+describe('dead keys and Unidentified emit nothing (M3)', () => {
+    let service: RemoteDesktopService;
+    let mod: RemoteDesktopModule;
+
+    beforeEach(() => {
+        vi.clearAllMocks();
+        mod = createMockModule();
+        service = new RemoteDesktopService(mod);
+        service.session = createMockSession();
+        service.setKeyboardUnicodeMode(true);
+    });
+
+    it('a Dead key (accent composition) emits no scancode and no Unicode', () => {
+        // `^` on French AZERTY: evt.key='Dead', evt.code='BracketLeft'. Must NOT type en-US "[".
+        service.sendKeyboardEvent(new KeyboardEvent('keydown', { code: 'BracketLeft', key: 'Dead' }));
+        expect(mod.DeviceEvent.keyPressed).not.toHaveBeenCalled();
+        expect(mod.DeviceEvent.unicodePressed).not.toHaveBeenCalled();
+    });
+
+    it('an Unidentified key emits nothing', () => {
+        service.sendKeyboardEvent(new KeyboardEvent('keydown', { code: 'KeyX', key: 'Unidentified' }));
+        expect(mod.DeviceEvent.keyPressed).not.toHaveBeenCalled();
+        expect(mod.DeviceEvent.unicodePressed).not.toHaveBeenCalled();
+    });
+});
+
+describe('non-ASCII fallback + no Shift stranding (M1)', () => {
+    let service: RemoteDesktopService;
+    let mod: RemoteDesktopModule;
+
+    beforeEach(() => {
+        vi.clearAllMocks();
+        mod = createMockModule();
+        service = new RemoteDesktopService(mod);
+        service.session = createMockSession();
+        service.setKeyboardUnicodeMode(true);
+    });
+    function key(code: string, k: string, mods: Partial<KeyboardEventInit> = {}) {
+        service.sendKeyboardEvent(new KeyboardEvent('keydown', { code, key: k, ...mods }));
+    }
+
+    it('accented "é" (not on US) falls back to a Unicode injection', () => {
+        key('KeyE', 'é');
+        expect(mod.DeviceEvent.unicodePressed).toHaveBeenCalledWith('é');
+    });
+
+    it('AltGr "€" (non-ASCII): Unicode injected, only the held Alt side released, ControlLeft untouched', () => {
+        service.sendKeyboardEvent(new KeyboardEvent('keydown', { code: 'AltRight', key: 'Alt', altKey: true }));
+        vi.clearAllMocks();
+        key('KeyE', '€', { altKey: true });
+        expect(mod.DeviceEvent.unicodePressed).toHaveBeenCalledWith('€');
+        expect(mod.DeviceEvent.keyReleased).toHaveBeenCalledWith(ALT_R);
+        expect(releasedWith(mod, CTRL_L)).toBe(false); // never held -> never touched
+        expect(releasedWith(mod, ALT_L)).toBe(false);
+    });
+
+    it('M1a: a lone Shift keyup (no prior keydown) does NOT seed a phantom held Shift', () => {
+        service.sendKeyboardEvent(new KeyboardEvent('keyup', { code: 'ShiftLeft', key: 'Shift' }));
+        expect(service.modifierKeyPressed).not.toContain('ShiftLeft');
+    });
+
+    it('M1: physical ShiftRight held -> Digit1 releases ONLY ShiftRight (not re-pressed), never fabricates/strands ShiftLeft', () => {
+        service.sendKeyboardEvent(new KeyboardEvent('keyup', { code: 'ShiftLeft', key: 'Shift' })); // was a phantom trigger
+        service.sendKeyboardEvent(new KeyboardEvent('keydown', { code: 'ShiftRight', key: 'Shift', shiftKey: true }));
+        vi.clearAllMocks();
+        key('Digit1', '1', { shiftKey: true });
+        expect(mod.DeviceEvent.keyReleased).toHaveBeenCalledWith(SHIFT_R);
+        expect(pressedWith(mod, SHIFT_R)).toBe(false); // the held side is released and NOT re-pressed (no phantom toggle)
+        expect(releasedWith(mod, SHIFT_L)).toBe(false);
+        expect(pressedWith(mod, SHIFT_L)).toBe(false); // no fabricated ShiftLeft
+    });
+
+    it('empty mirror + char needing no shift: no Shift toggling at all (no fabricated ShiftLeft)', () => {
+        // evt.shiftKey false, mirror empty -> mapped.shift(false) === shiftHeld(false) -> just tap.
+        key('KeyA', 'a');
+        expect(mod.DeviceEvent.keyPressed).toHaveBeenCalledWith(KEY_A);
+        expect(releasedWith(mod, SHIFT_L)).toBe(false);
+        expect(pressedWith(mod, SHIFT_L)).toBe(false);
+    });
+
+    it('releaseAllInputs (blur/focusLost) resets the modifier mirror', () => {
+        service.sendKeyboardEvent(new KeyboardEvent('keydown', { code: 'ShiftLeft', key: 'Shift', shiftKey: true }));
         expect(service.modifierKeyPressed.length).toBeGreaterThan(0);
-
         service.focusLost();
-
         expect(service.modifierKeyPressed).toEqual([]);
     });
 });
