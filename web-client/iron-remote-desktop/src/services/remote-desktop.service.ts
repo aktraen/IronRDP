@@ -1,5 +1,6 @@
 import { loggingService } from './logging.service';
 import { scanCode } from '../lib/scancodes';
+import { usKey, type UsKey } from '../lib/usKeymap';
 import { ModifierKey } from '../enums/ModifierKey';
 import { LockKey } from '../enums/LockKey';
 import type { NewSessionInfo } from '../interfaces/NewSessionInfo';
@@ -29,7 +30,6 @@ export class RemoteDesktopService {
     private module: RemoteDesktopModule;
     private canvas?: HTMLCanvasElement;
     private keyboardUnicodeMode: boolean = false;
-    private backendSupportsUnicodeKeyboardShortcuts: boolean | undefined = undefined;
     private onRemoteClipboardChanged?: OnRemoteClipboardChanged;
     private onForceClipboardUpdate?: OnForceClipboardUpdate;
     private onCanvasResized?: OnCanvasResized;
@@ -346,21 +346,6 @@ export class RemoteDesktopService {
         this.session?.releaseAllInputs();
     }
 
-    private supportsUnicodeKeyboardShortcuts(): boolean {
-        // Use cached value to reduce FFI calls
-        if (this.backendSupportsUnicodeKeyboardShortcuts !== undefined) {
-            return this.backendSupportsUnicodeKeyboardShortcuts;
-        }
-
-        if (this.session?.supportsUnicodeKeyboardShortcuts) {
-            this.backendSupportsUnicodeKeyboardShortcuts = this.session?.supportsUnicodeKeyboardShortcuts();
-            return this.backendSupportsUnicodeKeyboardShortcuts;
-        }
-
-        // By default we use unicode keyboard shortcuts for backends
-        return true;
-    }
-
     private sendKeyboard(evt: KeyboardEvent) {
         evt.preventDefault();
 
@@ -375,30 +360,16 @@ export class RemoteDesktopService {
             unicodeEvent = this.module.DeviceEvent.unicodeReleased;
         }
 
-        let sendAsUnicode = true;
-
-        if (!this.supportsUnicodeKeyboardShortcuts()) {
-            for (const modifier of ['Alt', 'Control', 'Meta', 'AltGraph', 'OS']) {
-                if (evt.getModifierState(modifier)) {
-                    sendAsUnicode = false;
-                    break;
-                }
-            }
-        }
-
         const isModifierKey = evt.code in ModifierKey;
         const isLockKey = evt.code in LockKey;
 
-        // AltGr-composed characters (BEPO/AZERTY `/`, `{`, `}`, `|`, `@`, `#`, `~`, `\`, `€`, ...)
-        // must be typed as the resulting character, not as a physical scancode routed through the
-        // guest layout while AltGr is held. Mirrors Guacamole's release_simulated_altgr: for a
-        // printable non-letter produced with Alt/AltGr (but not a Ctrl/Meta command chord), send the
-        // character as Unicode and release the Ctrl/Alt modifiers first so the guest sees a clean char.
-        // Letters are excluded so Ctrl+Alt+<letter> stays a shortcut (Guacamole assumes letters never
-        // need AltGr).
-        const codePoint = evt.key.length === 1 ? evt.key.codePointAt(0) ?? 0 : 0;
-        const isComposedChar =
-            this.keyboardUnicodeMode &&
+        // AltGr-composed characters (BEPO/AZERTY `/ { } | @ # ~ \ ...`) arrive with Ctrl+Alt (or the
+        // AltGraph modifier) held. On the en-US-pinned guest they are base or Shift characters, so the
+        // guest must not see Ctrl/Alt while the scancode is sent: strip them around the key, restore
+        // after. Letters are excluded so Ctrl+Alt+<letter> stays a command chord (Guacamole's assumption
+        // that letters never need AltGr); a lone Ctrl chord (Ctrl+C) is excluded too.
+        const codePoint = evt.key.length === 1 ? (evt.key.codePointAt(0) ?? 0) : 0;
+        const stripCtrlAlt =
             codePoint >= 0x20 &&
             codePoint !== 0x7f &&
             !isModifierKey &&
@@ -415,87 +386,149 @@ export class RemoteDesktopService {
             this.syncModifier(evt);
         }
 
-        if (!evt.repeat || (!isModifierKey && !isLockKey)) {
-            // For keyboard SHORTCUTS (a modifier is held) resolve the scancode from the CHARACTER the
-            // user typed, not the physical key position, so shortcuts are keyboard-layout independent
-            // (mirrors Guacamole's keysym approach): Ctrl+V pastes on QWERTY, BEPO, AZERTY alike. For
-            // plain typing (no modifier) the physical code path stays, since typed text goes as unicode.
-            let scanCodeSource = evt.code;
-            if (!sendAsUnicode && /^[a-z]$/i.test(evt.key)) {
-                scanCodeSource = 'Key' + evt.key.toUpperCase();
-            }
-            const keyScanCode = scanCode(scanCodeSource);
-            const unknownScanCode = Number.isNaN(keyScanCode);
-
-            if (!this.keyboardUnicodeMode && keyEvent && !unknownScanCode) {
-                this.doTransactionFromDeviceEvents([keyEvent(keyScanCode)]);
-                return;
-            }
-
-            if (this.keyboardUnicodeMode && unicodeEvent && keyEvent) {
-                // `Dead` and `Unidentified` keys should be ignored
-                if (['Dead', 'Unidentified'].indexOf(evt.key) != -1) {
-                    return;
-                }
-
-                if (isComposedChar) {
-                    const events: DeviceEvent[] = [];
-                    if (evt.type === 'keydown') {
-                        for (const code of ['ControlLeft', 'ControlRight', 'AltLeft', 'AltRight']) {
-                            const modScanCode = scanCode(code);
-                            if (!Number.isNaN(modScanCode)) {
-                                events.push(this.module.DeviceEvent.keyReleased(modScanCode));
-                            }
-                        }
-                    }
-                    events.push(unicodeEvent(evt.key));
-                    this.doTransactionFromDeviceEvents(events);
-                    return;
-                }
-
-                const keyCode = scanCode(evt.key);
-                const isUnicodeCharacter = Number.isNaN(keyCode) && evt.key.length === 1 && !isModifierKey;
-
-                if (isUnicodeCharacter && sendAsUnicode) {
-                    // The character is injected as Unicode (WYSIWYG: the OS already resolved which
-                    // glyph the key produces). A physically-held Shift would be re-applied by the
-                    // guest to that injection and corrupt it: on BEPO/AZERTY the number row's SHIFTED
-                    // level types the DIGITS 1234567890, but with the Shift scancode still down the
-                    // guest yields the guest-layout shifted symbol (!@#$%^&*() on a US guest) instead.
-                    // Mirror Guacamole's release_simulated_altgr (Keyboard.js): release the held
-                    // modifier scancode(s) around the character, then RESTORE them so subsequent
-                    // Shift+navigation (Shift+ArrowLeft/Home/End text selection) still applies Shift.
-                    //
-                    // Gate on THIS event's own Shift truth (evt.shiftKey), not the modifierKeyPressed
-                    // mirror. The mirror can drift out of sync with the guest's real Shift state
-                    // (releaseAllInputs releases the guest's keys without clearing it; a Shift keyup
-                    // seen without a preceding keydown after focus is gained mid-hold pushes a phantom
-                    // entry). If we re-pressed a Shift from a stale mirror while Shift is not really
-                    // held, we would STRAND Shift down on the guest and every later key would be
-                    // shifted. With the gate, a char typed while Shift is genuinely up never toggles
-                    // Shift. modifierKeyPressed is used only to pick WHICH side (Left/Right) to toggle.
-                    const shiftScanCodes =
-                        evt.type === 'keydown' && evt.shiftKey ? this.heldShiftScanCodes() : [];
-                    if (shiftScanCodes.length > 0) {
-                        const events: DeviceEvent[] = [];
-                        for (const sc of shiftScanCodes) {
-                            events.push(this.module.DeviceEvent.keyReleased(sc));
-                        }
-                        events.push(unicodeEvent(evt.key));
-                        for (const sc of shiftScanCodes) {
-                            events.push(this.module.DeviceEvent.keyPressed(sc));
-                        }
-                        this.doTransactionFromDeviceEvents(events);
-                    } else {
-                        this.doTransactionFromDeviceEvents([unicodeEvent(evt.key)]);
-                    }
-                } else if (!unknownScanCode) {
-                    // Use scancode instead of key code for non-unicode character values
-                    this.doTransactionFromDeviceEvents([keyEvent(keyScanCode)]);
-                }
-                return;
-            }
+        if (evt.repeat && (isModifierKey || isLockKey)) {
+            return;
         }
+
+        // Modifier and lock keys: forward the physical scancode so the guest holds them for chords
+        // (Ctrl+C, Ctrl+Shift+V, AltGr). Their pressed/lock state is tracked above. CapsLock is the
+        // exception -- it is handled ABSOLUTELY by syncModifier (forced off), so forwarding its scancode
+        // (an edge-triggered toggle) would fight that sync; skip it.
+        if (isModifierKey || isLockKey) {
+            if (evt.code === LockKey.CAPS_LOCK) {
+                return;
+            }
+            const modSc = scanCode(evt.code);
+            if (keyEvent && !Number.isNaN(modSc)) {
+                this.doTransactionFromDeviceEvents([keyEvent(modSc)]);
+            }
+            return;
+        }
+
+        // Dead keys (accent composition: `^` `¨` on French, all of `' " ` ^ ~` on US-International) and
+        // Unidentified keys must emit NOTHING -- the composed character arrives on the next event. Guard
+        // here, before the scancode fallback below would forward their physical scancode and type a stray
+        // character on the en-US guest (`^` dead key -> `[`).
+        if (evt.key === 'Dead' || evt.key === 'Unidentified') {
+            return;
+        }
+
+        // A single printable character: reproduce it on the en-US-pinned guest the way Guacamole does
+        // (key on the CHARACTER the user meant -- evt.key, already resolved through the client's own
+        // layout -- and send the US scancode + Shift that yields it). Correct for every client layout,
+        // and, unlike a Unicode-keysym injection, correct in terminals too. Gated on unicode mode (the
+        // component enables it); without it the base package keeps its plain physical-scancode default.
+        if (this.keyboardUnicodeMode && evt.key.length === 1) {
+            const mapped = usKey(evt.key);
+            if (mapped) {
+                this.sendUsCharacter(evt, mapped, stripCtrlAlt);
+                return;
+            }
+            // Non-ASCII (accents, currency): no US scancode exists, so inject the Unicode codepoint,
+            // releasing any held Shift/AltGr around it so the guest does not re-shift the injection.
+            // (Dead/Unidentified already returned above.)
+            if (keyEvent && unicodeEvent) {
+                this.sendUnicodeCharacter(evt, stripCtrlAlt);
+            }
+            return;
+        }
+
+        // Non-printable key (Enter, Tab, Backspace, arrows, F-keys, Home/End, ...): its physical
+        // position is layout-independent, so forward the scancode down/up as-is.
+        const sc = scanCode(evt.code);
+        if (keyEvent && !Number.isNaN(sc)) {
+            this.doTransactionFromDeviceEvents([keyEvent(sc)]);
+        }
+    }
+
+    /// Reproduce a printable US-QWERTY character on the en-US-pinned guest (Guacamole's keysym->scancode
+    /// model). The whole thing is emitted as ONE atomic transaction on keydown: strip any AltGr the
+    /// client used, set Shift to exactly what the US layout needs for this character, tap the scancode,
+    /// then restore the physical modifier state -- so no modifier can strand across events. keyup carries
+    /// nothing (auto-repeat re-fires keydown). Command chords (Ctrl+C) keep their modifiers: Ctrl is
+    /// forwarded by its own key event and is never stripped here.
+    private sendUsCharacter(evt: KeyboardEvent, mapped: UsKey, stripCtrlAlt: boolean) {
+        if (evt.type !== 'keydown') {
+            return;
+        }
+        const sc = scanCode(mapped.code);
+        if (Number.isNaN(sc)) {
+            return;
+        }
+        const device = this.module.DeviceEvent;
+        const events: DeviceEvent[] = [];
+
+        // Strip only the Ctrl/Alt side(s) actually held (from the tracked mirror), never a hardcoded
+        // four -- re-pressing a side the user never held would emit a real make code and STRAND it down.
+        const altGrScanCodes = stripCtrlAlt ? this.heldCtrlAltScanCodes() : [];
+        for (const modSc of altGrScanCodes) {
+            events.push(device.keyReleased(modSc));
+        }
+
+        // Set Shift to the US requirement for this character. Guacamole's model (guac_rdp
+        // keyboard.c update_modifiers): a modifier is a lazy state -- toggle it only when the next
+        // character needs a different state, and NEVER restore it in the same batch as the key. When
+        // Shift is needed but none is held, tap ShiftLeft around the key. When the char needs NO shift
+        // but the client physically holds Shift (a layout-shifted digit on AZERTY/BEPO: `evt.key="1"`,
+        // `shiftKey=true`), release the held Shift BEFORE the key and LEAVE it released -- do not
+        // re-press it here. Re-pressing it bracketed every such digit with a phantom Shift release +
+        // Shift re-press; a terminal that honours the live modifier event stream (CSI-u / modifyOtherKeys
+        // / the kitty keyboard protocol -- vim, tmux, TUIs) then reports spurious Shift toggles around
+        // each digit, so digits "don't come out right" in the terminal even though GUI toolkits (which
+        // read only the resolved keysym) tolerate it. The guest Shift is reconciled lazily: the next
+        // char needing Shift re-presses it (the `mapped.shift` branch), and the eventual physical Shift
+        // keyup forwards its break (releasing an already-released Shift is a no-op on the guest).
+        const shiftHeld = evt.shiftKey;
+        if (mapped.shift === shiftHeld) {
+            events.push(device.keyPressed(sc));
+            events.push(device.keyReleased(sc));
+        } else if (mapped.shift) {
+            const shiftLeft = scanCode('ShiftLeft');
+            events.push(device.keyPressed(shiftLeft));
+            events.push(device.keyPressed(sc));
+            events.push(device.keyReleased(sc));
+            events.push(device.keyReleased(shiftLeft));
+        } else {
+            const shifts = this.heldShiftScanCodes();
+            for (const shiftSc of shifts) {
+                events.push(device.keyReleased(shiftSc));
+            }
+            events.push(device.keyPressed(sc));
+            events.push(device.keyReleased(sc));
+        }
+
+        for (const modSc of altGrScanCodes) {
+            events.push(device.keyPressed(modSc));
+        }
+        this.doTransactionFromDeviceEvents(events);
+    }
+
+    /// Fallback for a non-ASCII printable character (accent, currency) that the en-US layout cannot
+    /// produce with a scancode: inject the Unicode codepoint, releasing any held Shift/AltGr around the
+    /// injection (a physically-held modifier would be re-applied by the guest to the injected keysym and
+    /// corrupt it), then restoring so Shift+navigation still works.
+    private sendUnicodeCharacter(evt: KeyboardEvent, stripCtrlAlt: boolean) {
+        const device = this.module.DeviceEvent;
+        const unicode = evt.type === 'keydown' ? device.unicodePressed : device.unicodeReleased;
+        const events: DeviceEvent[] = [];
+
+        const altGrScanCodes = stripCtrlAlt && evt.type === 'keydown' ? this.heldCtrlAltScanCodes() : [];
+        const shiftScanCodes = evt.type === 'keydown' && evt.shiftKey ? this.heldShiftScanCodes() : [];
+
+        for (const modSc of altGrScanCodes) {
+            events.push(device.keyReleased(modSc));
+        }
+        for (const shiftSc of shiftScanCodes) {
+            events.push(device.keyReleased(shiftSc));
+        }
+        events.push(unicode(evt.key));
+        for (const shiftSc of shiftScanCodes) {
+            events.push(device.keyPressed(shiftSc));
+        }
+        for (const modSc of altGrScanCodes) {
+            events.push(device.keyPressed(modSc));
+        }
+        this.doTransactionFromDeviceEvents(events);
     }
 
     private setCursorStyleCallback(
@@ -547,17 +580,14 @@ export class RemoteDesktopService {
     }
 
     private syncModifier(evt: KeyboardEvent | MouseEvent): void {
-        const syncCapsLockActive = evt.getModifierState(LockKey.CAPS_LOCK);
         const syncNumsLockActive = evt.getModifierState(LockKey.NUM_LOCK);
         const syncScrollLockActive = evt.getModifierState(LockKey.SCROLL_LOCK);
         const syncKanaModeActive = evt.getModifierState(LockKey.KANA_MODE);
 
-        this.session?.synchronizeLockKeys(
-            syncScrollLockActive,
-            syncNumsLockActive,
-            syncCapsLockActive,
-            syncKanaModeActive,
-        );
+        // Force the guest's CapsLock OFF regardless of the client. The character model already encodes
+        // case in evt.key -> mapped.shift (explicit Shift for capitals), so mirroring the client's Caps
+        // onto the guest would apply case a SECOND time and invert every letter. Num/Scroll/Kana sync.
+        this.session?.synchronizeLockKeys(syncScrollLockActive, syncNumsLockActive, false, syncKanaModeActive);
     }
 
     /// Windows scancodes for the Shift key(s) currently held down, as tracked in
@@ -580,13 +610,39 @@ export class RemoteDesktopService {
         return codes;
     }
 
+    /// Windows scancodes for the Ctrl/Alt key(s) currently held down, tracked in modifierKeyPressed --
+    /// the ones we actually pressed on the guest. Strip AltGr around a character using ONLY these, so a
+    /// Ctrl/Alt side the user never held is never re-pressed and stranded.
+    private heldCtrlAltScanCodes(): number[] {
+        const codes: number[] = [];
+        for (const [modifier, keyCode] of [
+            [ModifierKey.CTRL_LEFT, 'ControlLeft'],
+            [ModifierKey.CTRL_RIGHT, 'ControlRight'],
+            [ModifierKey.ALT_LEFT, 'AltLeft'],
+            [ModifierKey.ALT_RIGHT, 'AltRight'],
+        ] as const) {
+            if (this.modifierKeyPressed.indexOf(modifier) !== -1) {
+                const sc = scanCode(keyCode);
+                if (!Number.isNaN(sc)) {
+                    codes.push(sc);
+                }
+            }
+        }
+        return codes;
+    }
+
     private updateModifierKeyState(evt: KeyboardEvent) {
         const modKey: ModifierKey = ModifierKey[evt.code as keyof typeof ModifierKey];
+        const idx = this.modifierKeyPressed.indexOf(modKey);
 
-        if (this.modifierKeyPressed.indexOf(modKey) === -1) {
-            this.modifierKeyPressed.push(modKey);
-        } else if (evt.type === 'keyup') {
-            this.modifierKeyPressed.splice(this.modifierKeyPressed.indexOf(modKey), 1);
+        // Gate on event type: a lone keyup with no prior keydown (focus gained mid-hold) must NOT seed a
+        // phantom "held" entry -- a phantom would later be re-pressed and strand the modifier down.
+        if (evt.type === 'keydown') {
+            if (idx === -1) {
+                this.modifierKeyPressed.push(modKey);
+            }
+        } else if (evt.type === 'keyup' && idx !== -1) {
+            this.modifierKeyPressed.splice(idx, 1);
         }
     }
 
