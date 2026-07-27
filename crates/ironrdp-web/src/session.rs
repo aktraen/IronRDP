@@ -1506,7 +1506,7 @@ fn build_config(
         enable_standard_rdp_security: false,
         keyboard_type: ironrdp::pdu::gcc::KeyboardType::IBM_ENHANCED,
         keyboard_subtype: 0,
-        keyboard_layout: 0, // the server SHOULD use the default active input locale identifier
+        keyboard_layout: 0x0000_040C, // French (fr-FR): xrdp pins the guest XKB to "fr" at session start, so accents are native scancodes (reach xkb terminals like Alacritty), not Unicode injection
         keyboard_functional_keys_count: 12,
         connection_type: ironrdp::pdu::gcc::ConnectionType::Lan,
         ime_file_name: String::new(),

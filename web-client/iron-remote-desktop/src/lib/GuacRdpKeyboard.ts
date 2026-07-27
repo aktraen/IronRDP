@@ -2,28 +2,37 @@
 //
 // This is guacd's keysym -> scancode + modifier state machine. It receives X11 keysyms (press/release)
 // from the client half (GuacKeyboard, the Keyboard.js port) and emits the RDP scancode + Shift/AltGr
-// key events required to reproduce that keysym on the en-US-pinned guest, reconciling the guest's
+// key events required to reproduce that keysym on the French-pinned guest (WASM advertises
+// keyboard_layout=0x040C, so xrdp sets the guest XKB to "fr" at session start), reconciling the guest's
 // modifier state LAZILY: only the delta between the modifiers the guest currently holds and the ones
-// the target keysym requires is sent. This is what makes typing terminal-correct -- e.g. an
-// AZERTY/BEPO Shift-held number row releases the guest Shift once (for the first digit) and it STAYS
-// released because get_modifier_flags derives Shift from the guest's ACTUAL pressed scancodes, not the
-// client's physical Shift. When the client has released every key, the server releases everything it
-// still holds (guac_rdp_keyboard_reset), including any Shift/AltGr it pressed on the guest's behalf.
+// the target keysym requires is sent. This is what makes typing terminal-correct -- e.g. a Shift-held
+// number row releases/re-uses the guest Shift without per-digit churn because get_modifier_flags derives
+// Shift from the guest's ACTUAL pressed scancodes, not the client's physical Shift. When the client has
+// released every key, the server releases everything it still holds (guac_rdp_keyboard_reset), including
+// any Shift/AltGr it pressed on the guest's behalf.
 //
-// Deliberate deviations from keyboard.c, both a consequence of the en-US pin and documented so the
-// coordinator can diff against the source:
+// The French pin is what lets accents type as NATIVE scancodes (é è à ç ù are direct keys; ê ë â û î ï
+// ô ö ü compose via the dead circumflex/dieresis keys, see decompose below) -- which xkb terminals
+// (Alacritty) receive, unlike an RDP Unicode injection, which this guest's xrdp surfaces only to
+// IM-aware GTK apps. The client half stays character-keyed (evt.key), so this is correct for every
+// client layout (AZERTY / BEPO / QWERTY): the character the user meant is reproduced with the French
+// scancode + Shift/AltGr that yields it.
+//
+// Deliberate deviations from keyboard.c, documented so the coordinator can diff against the source:
 //   1. Lock keys (Caps/Num/Scroll) are NOT synchronized from here. keyboard.c drives guest locks via a
 //      SynchronizeEvent; here the guest's lock state is owned out-of-band by the service
 //      (session.synchronizeLockKeys, forcing Caps OFF because case is already encoded in the character
-//      keysym + Shift). lock_flags is kept only for the cost model, which -- with lock_flags pinned at
-//      0 -- always selects the Shift-based (-caps) definition, exactly what an en-US guest needs.
-//   2. Undefined keysyms (accents/currency not on en-US, e.g. e-acute) are sent as an RDP Unicode
-//      event, matching send_missing_key's Unicode fallback (decompose always fails on the en-US keymap
-//      since no dead keys are defined). Unlike keyboard.c's single event, we emit a press on keydown
-//      and a release on keyup because the RDP Unicode event the fork's WASM exposes is a down/up pair.
+//      keysym + Shift). lock_flags is kept only for the cost model.
+//   2. Truly undefined keysyms -- a character neither on the French layout nor decomposable via a dead
+//      key defined in it (e.g. German sharp-s, or accents needing dead acute/grave/tilde, which fr does
+//      not define) -- fall back to an RDP Unicode event, matching send_missing_key's Unicode fallback.
+//      Like keyboard.c, that is exactly ONE Unicode event on the press (no matching release: a release
+//      makes xrdp un-map the temporary keycode before an xkb terminal resolves it). Such characters
+//      therefore appear only in IM-aware/GUI fields, not in xkb terminals -- an accepted tradeoff for a
+//      French deployment.
 
 import {
-    EN_US_QWERTY_KEYMAP,
+    GUEST_KEYMAP,
     keysymScancode,
     type KeysymDesc,
     MOD_SHIFT,
@@ -90,7 +99,7 @@ export class GuacRdpKeyboard {
 
     constructor(sink: GuacRdpKeyboardSink) {
         this.sink = sink;
-        for (const mapping of EN_US_QWERTY_KEYMAP) {
+        for (const mapping of GUEST_KEYMAP) {
             this.addMapping(mapping);
         }
     }
@@ -212,13 +221,79 @@ export class GuacRdpKeyboard {
         return def;
     }
 
-    // guac_rdp_keyboard_send_missing_key, reduced to its Unicode fallback (decompose always fails on the
-    // en-US keymap). Like keyboard.c, this fires exactly ONE RDP Unicode event, on the keysym press
-    // ("Unlike key events, RDP Unicode events do not have a pressed or released state" -- keyboard.c).
-    // Sending a matching Unicode RELEASE (as a naive down/up pairing would) makes xrdp re-map and then
-    // immediately un-map the temporary keycode, and xkb-based terminals (Alacritty) then fail to resolve
-    // the injected keysym to a character -- so no release is sent.
+    // guac_rdp_decomposed_keys (decompose.c): accented Latin-1 char keysym -> [dead-key keysym, base-key
+    // keysym]. Dead keysyms: grave 0xfe50, acute 0xfe51, circumflex 0xfe52, tilde 0xfe53, dieresis
+    // 0xfe57, abovering 0xfe58. Base keysyms are the plain characters (' ', A-Z, a-z).
+    private static readonly decomposedKeys = new Map<number, [number, number]>([
+        [0x5e, [0xfe52, 0x20]],
+        [0x60, [0xfe50, 0x20]],
+        [0x7e, [0xfe53, 0x20]],
+        [0xa8, [0xfe57, 0x20]],
+        [0xb4, [0xfe51, 0x20]],
+        [0xc0, [0xfe50, 0x41]],
+        [0xc1, [0xfe51, 0x41]],
+        [0xc2, [0xfe52, 0x41]],
+        [0xc3, [0xfe53, 0x41]],
+        [0xc4, [0xfe57, 0x41]],
+        [0xc5, [0xfe58, 0x41]],
+        [0xc8, [0xfe50, 0x45]],
+        [0xc9, [0xfe51, 0x45]],
+        [0xca, [0xfe52, 0x45]],
+        [0xcb, [0xfe57, 0x45]],
+        [0xcc, [0xfe50, 0x49]],
+        [0xcd, [0xfe51, 0x49]],
+        [0xce, [0xfe52, 0x49]],
+        [0xcf, [0xfe57, 0x49]],
+        [0xd1, [0xfe53, 0x4e]],
+        [0xd2, [0xfe50, 0x4f]],
+        [0xd3, [0xfe51, 0x4f]],
+        [0xd4, [0xfe52, 0x4f]],
+        [0xd5, [0xfe53, 0x4f]],
+        [0xd6, [0xfe57, 0x4f]],
+        [0xd9, [0xfe50, 0x55]],
+        [0xda, [0xfe51, 0x55]],
+        [0xdb, [0xfe52, 0x55]],
+        [0xdc, [0xfe57, 0x55]],
+        [0xdd, [0xfe51, 0x59]],
+        [0xe0, [0xfe50, 0x61]],
+        [0xe1, [0xfe51, 0x61]],
+        [0xe2, [0xfe52, 0x61]],
+        [0xe3, [0xfe53, 0x61]],
+        [0xe4, [0xfe57, 0x61]],
+        [0xe5, [0xfe58, 0x61]],
+        [0xe8, [0xfe50, 0x65]],
+        [0xe9, [0xfe51, 0x65]],
+        [0xea, [0xfe52, 0x65]],
+        [0xeb, [0xfe57, 0x65]],
+        [0xec, [0xfe50, 0x69]],
+        [0xed, [0xfe51, 0x69]],
+        [0xee, [0xfe52, 0x69]],
+        [0xef, [0xfe57, 0x69]],
+        [0xf1, [0xfe53, 0x6e]],
+        [0xf2, [0xfe50, 0x6f]],
+        [0xf3, [0xfe51, 0x6f]],
+        [0xf4, [0xfe52, 0x6f]],
+        [0xf5, [0xfe53, 0x6f]],
+        [0xf6, [0xfe57, 0x6f]],
+        [0xf9, [0xfe50, 0x75]],
+        [0xfa, [0xfe51, 0x75]],
+        [0xfb, [0xfe52, 0x75]],
+        [0xfc, [0xfe57, 0x75]],
+        [0xfd, [0xfe51, 0x79]],
+        [0xff, [0xfe57, 0x79]],
+    ]);
+
+    // guac_rdp_keyboard_send_missing_key: first try to type the character as a dead key + base key using
+    // REAL scancodes (guac_rdp_decompose_keysym) -- on the French guest, e-circumflex etc. compose via
+    // the dead circumflex/dieresis keys and land in xkb terminals like Alacritty. Only if decomposition
+    // is not possible does it fall back to a single RDP Unicode event (which this guest's xrdp surfaces
+    // only to IM-aware apps, not xkb terminals). Like keyboard.c, the Unicode fallback fires exactly ONE
+    // event on the press; sending a matching Unicode RELEASE makes xrdp un-map the temporary keycode
+    // before an xkb terminal resolves it, so no release is sent.
     private sendMissingKey(keysym: number): void {
+        if (this.decompose(keysym)) {
+            return;
+        }
         let codepoint: number;
         if (keysym <= 0xff) {
             codepoint = keysym;
@@ -228,6 +303,28 @@ export class GuacRdpKeyboard {
             return;
         }
         this.sink.sendUnicode(codepoint);
+    }
+
+    // guac_rdp_decompose_keysym + guac_rdp_decomposed_keys (decompose.c). Types an accented Latin-1
+    // character as a dead key followed by its base key, both as real scancodes, when both keysyms are
+    // defined in the current keymap. Returns true if the keysym was handled this way.
+    private decompose(keysym: number): boolean {
+        if (keysym < 0x00 || keysym > 0xff) {
+            return false;
+        }
+        const entry = GuacRdpKeyboard.decomposedKeys.get(keysym);
+        if (entry === undefined) {
+            return false;
+        }
+        const [dead, base] = entry;
+        if (this.getKey(dead) === null || this.getKey(base) === null) {
+            return false;
+        }
+        this.updateKeysym(dead, true, KeySource.Synthetic);
+        this.updateKeysym(dead, false, KeySource.Synthetic);
+        this.updateKeysym(base, true, KeySource.Synthetic);
+        this.updateKeysym(base, false, KeySource.Synthetic);
+        return true;
     }
 
     // guac_rdp_keyboard_update_locks: kept faithful for the cost model; the guest is NOT synchronized
