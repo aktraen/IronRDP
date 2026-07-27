@@ -71,6 +71,7 @@
         userInteractionListeners();
 
         window.addEventListener('keydown', captureKeys, false);
+        window.addEventListener('keypress', captureKeys, false);
         window.addEventListener('keyup', captureKeys, false);
 
         window.addEventListener('focus', focusEventHandler);
@@ -415,6 +416,7 @@
     onDestroy(() => {
         window.removeEventListener('resize', resizeHandler);
         window.removeEventListener('keydown', captureKeys, false);
+        window.removeEventListener('keypress', captureKeys, false);
         window.removeEventListener('keyup', captureKeys, false);
         window.removeEventListener('focus', focusEventHandler);
         window.removeEventListener('blur', blurEventHandler);

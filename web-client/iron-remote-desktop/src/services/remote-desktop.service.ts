@@ -1,7 +1,8 @@
 import { loggingService } from './logging.service';
 import { scanCode } from '../lib/scancodes';
-import { usKey, type UsKey } from '../lib/usKeymap';
-import { ModifierKey } from '../enums/ModifierKey';
+import { GuacKeyboard } from '../lib/GuacKeyboard';
+import { GuacRdpKeyboard, KeySource, type GuacRdpKeyboardSink } from '../lib/GuacRdpKeyboard';
+import { KEYSYM_CAPS_LOCK, KEYSYM_NUM_LOCK, KEYSYM_SCROLL_LOCK } from '../lib/guacKeyboardMap';
 import { LockKey } from '../enums/LockKey';
 import type { NewSessionInfo } from '../interfaces/NewSessionInfo';
 import { SpecialCombination } from '../enums/SpecialCombination';
@@ -46,15 +47,18 @@ export class RemoteDesktopService {
     resizeObservable: Observable<ResizeEvent> = new Observable();
 
     session?: Session;
-    modifierKeyPressed: ModifierKey[] = [];
 
-    // The scancode of the Shift key currently held on the GUEST, or null. The guest's Shift is a lazy
-    // state tracked separately from the physical mirror (modifierKeyPressed): a layout-shifted digit
-    // releases it and LEAVES it released (terminal-safe -- no per-digit re-press churn), and it is
-    // reconciled to what the NEXT event needs (the character's Shift requirement, or the physical Shift
-    // for a navigation key) instead of being restored eagerly. This is Guacamole's guest-side modifier
-    // model (guac_rdp keyboard.c update_modifiers): only the delta from the current guest state is sent.
-    private guestShiftScanCode: number | null = null;
+    // The two halves of the ported Guacamole keyboard. guacKeyboard is the Keyboard.js client half
+    // (browser event -> X11 keysym); guacRdp is the keyboard.c server half (keysym -> scancode +
+    // lazy Shift/AltGr reconciliation). They are wired below so that the keysym stream the client half
+    // emits drives the server half, whose scancode/Unicode output is batched into RDP transactions.
+    private readonly guacKeyboard = new GuacKeyboard();
+    private readonly guacRdp: GuacRdpKeyboard;
+
+    // Scancode/Unicode DeviceEvents accumulated while the server half handles a single keysym, flushed
+    // as one InputTransaction per keysym (a keysym may expand to several events: reconcile Shift, tap
+    // the key, ...). The RDP server processes transactions in order, so per-keysym batching is exact.
+    private pendingKeyEvents: DeviceEvent[] = [];
 
     mousePositionObservable: Observable<MousePosition> = new Observable();
     changeVisibilityObservable: Observable<boolean> = new Observable();
@@ -64,7 +68,55 @@ export class RemoteDesktopService {
 
     constructor(module: RemoteDesktopModule) {
         this.module = module;
+
+        // The sink the server half emits to: scancode/Unicode events are queued, then flushed per
+        // keysym by the onKeyDown/onKeyUp wrappers below.
+        const sink: GuacRdpKeyboardSink = {
+            sendScancode: (scancode: number, pressed: boolean) => {
+                const device = this.module.DeviceEvent;
+                this.pendingKeyEvents.push(pressed ? device.keyPressed(scancode) : device.keyReleased(scancode));
+            },
+            sendUnicode: (codepoint: number) => {
+                // One RDP Unicode event types the character (no held state). unicodeReleased is not sent:
+                // it makes xkb-based terminals (Alacritty) drop the injected keysym. See GuacRdpKeyboard.
+                this.pendingKeyEvents.push(this.module.DeviceEvent.unicodePressed(String.fromCodePoint(codepoint)));
+            },
+        };
+        this.guacRdp = new GuacRdpKeyboard(sink);
+
+        // Client half keysym stream -> server half. Lock keysyms (Caps/Num/Scroll) are NOT forwarded to
+        // the guest here: the guest is en-US-pinned and case is encoded in the character + Shift, so the
+        // guest lock state is driven out-of-band by syncModifier (Caps forced OFF). Each forwarded keysym
+        // is flushed as its own transaction.
+        this.guacKeyboard.onKeyDown = (keysym: number): boolean => {
+            if (!RemoteDesktopService.isForwardedLockKeysym(keysym)) {
+                this.pendingKeyEvents = [];
+                this.guacRdp.updateKeysym(keysym, true, KeySource.Client);
+                this.flushPendingKeyEvents();
+            }
+            return false;
+        };
+        this.guacKeyboard.onKeyUp = (keysym: number): void => {
+            if (!RemoteDesktopService.isForwardedLockKeysym(keysym)) {
+                this.pendingKeyEvents = [];
+                this.guacRdp.updateKeysym(keysym, false, KeySource.Client);
+                this.flushPendingKeyEvents();
+            }
+        };
+
         loggingService.info('Web bridge initialized.');
+    }
+
+    private static isForwardedLockKeysym(keysym: number): boolean {
+        return keysym === KEYSYM_CAPS_LOCK || keysym === KEYSYM_NUM_LOCK || keysym === KEYSYM_SCROLL_LOCK;
+    }
+
+    private flushPendingKeyEvents(): void {
+        if (this.pendingKeyEvents.length > 0) {
+            const events = this.pendingKeyEvents;
+            this.pendingKeyEvents = [];
+            this.doTransactionFromDeviceEvents(events);
+        }
     }
 
     get autoClipboard(): boolean {
@@ -347,198 +399,59 @@ export class RemoteDesktopService {
     }
 
     private releaseAllInputs() {
-        // The guest releases every held key, so the local mirror AND the tracked guest-Shift state must
-        // be cleared too; otherwise they drift (a stale Shift left behind across blur/alt-tab/mouse-out
-        // would make the next reconcile release or re-press a Shift the guest no longer holds).
-        this.modifierKeyPressed = [];
-        this.guestShiftScanCode = null;
+        // Blur/alt-tab/mouse-out: release everything so no key is stranded down. The client half
+        // releases every keysym it holds (firing keyup -> the server half releases the matching
+        // scancodes and, once nothing is user-held, resets any Shift/AltGr it pressed on the guest's
+        // behalf), then the server half drops any residual synthetic/Unicode state, then the WASM side
+        // is told to release all. Matches Guacamole.Keyboard.reset + guac_rdp_keyboard_reset.
+        this.guacKeyboard.reset();
+        this.guacRdp.releaseAll();
         this.session?.releaseAllInputs();
     }
 
+    // Feed a browser key event into the ported Guacamole pipeline (when unicode mode is on) or the base
+    // package's plain physical-scancode path (when off). preventDefault is applied the way Guacamole's
+    // listenTo does: NOT blanket on keydown/keypress (that would suppress the keypress event the client
+    // half relies on to disambiguate a printable keydown), only when the pipeline actually handled the
+    // event; keyup is always prevented.
     private sendKeyboard(evt: KeyboardEvent) {
+        if (this.keyboardUnicodeMode) {
+            // Guest lock state (Num/Scroll synced from the OS, Caps forced OFF) is driven out-of-band --
+            // the character keysym + Shift already encode case, so mirroring Caps would double-apply it.
+            if (evt.code in LockKey) {
+                this.syncModifier(evt);
+            }
+
+            if (evt.type === 'keydown') {
+                if (this.guacKeyboard.handleKeyDown(evt)) {
+                    evt.preventDefault();
+                }
+            } else if (evt.type === 'keypress') {
+                if (this.guacKeyboard.handleKeyPress(evt)) {
+                    evt.preventDefault();
+                }
+            } else if (evt.type === 'keyup') {
+                evt.preventDefault();
+                this.guacKeyboard.handleKeyUp(evt);
+            }
+            return;
+        }
+
+        // Base package default (unicode mode off): forward the physical scancode of the key position,
+        // down on keydown and up on keyup. keypress carries no scancode and is ignored.
         evt.preventDefault();
-
         let keyEvent;
-        let unicodeEvent;
-
         if (evt.type === 'keydown') {
             keyEvent = this.module.DeviceEvent.keyPressed;
-            unicodeEvent = this.module.DeviceEvent.unicodePressed;
         } else if (evt.type === 'keyup') {
             keyEvent = this.module.DeviceEvent.keyReleased;
-            unicodeEvent = this.module.DeviceEvent.unicodeReleased;
-        }
-
-        const isModifierKey = evt.code in ModifierKey;
-        const isLockKey = evt.code in LockKey;
-
-        // AltGr-composed characters (BEPO/AZERTY `/ { } | @ # ~ \ ...`) arrive with Ctrl+Alt (or the
-        // AltGraph modifier) held. On the en-US-pinned guest they are base or Shift characters, so the
-        // guest must not see Ctrl/Alt while the scancode is sent: strip them around the key, restore
-        // after. Letters are excluded so Ctrl+Alt+<letter> stays a command chord (Guacamole's assumption
-        // that letters never need AltGr); a lone Ctrl chord (Ctrl+C) is excluded too.
-        const codePoint = evt.key.length === 1 ? (evt.key.codePointAt(0) ?? 0) : 0;
-        const stripCtrlAlt =
-            codePoint >= 0x20 &&
-            codePoint !== 0x7f &&
-            !isModifierKey &&
-            !/^[a-z]$/i.test(evt.key) &&
-            (evt.altKey || evt.getModifierState('AltGraph')) &&
-            !evt.metaKey &&
-            !(evt.ctrlKey && !evt.altKey);
-
-        if (isModifierKey) {
-            this.updateModifierKeyState(evt);
-        }
-
-        if (isLockKey) {
-            this.syncModifier(evt);
-        }
-
-        if (evt.repeat && (isModifierKey || isLockKey)) {
+        } else {
             return;
         }
-
-        // Modifier and lock keys: forward the physical scancode so the guest holds them for chords
-        // (Ctrl+C, Ctrl+Shift+V, AltGr). Their pressed/lock state is tracked above. CapsLock is the
-        // exception -- it is handled ABSOLUTELY by syncModifier (forced off), so forwarding its scancode
-        // (an edge-triggered toggle) would fight that sync; skip it.
-        if (isModifierKey || isLockKey) {
-            if (evt.code === LockKey.CAPS_LOCK) {
-                return;
-            }
-            // Shift is managed as lazy GUEST state (see guestShiftScanCode): reconcile the guest Shift to
-            // the physical Shift still held, collapsing both sides to a single guest key. Forwarding the
-            // raw Shift scancode here instead would desync the guest from a layout-shifted digit that
-            // lazily released it (the digit's re-press regression), and would strand a side if a capital
-            // re-pressed a different Shift than the one physically held.
-            if (evt.code === ModifierKey.SHIFT_LEFT || evt.code === ModifierKey.SHIFT_RIGHT) {
-                const shiftEvents = this.syncGuestShift(this.isPhysicalShiftHeld());
-                if (shiftEvents.length > 0) {
-                    this.doTransactionFromDeviceEvents(shiftEvents);
-                }
-                return;
-            }
-            const modSc = scanCode(evt.code);
-            if (keyEvent && !Number.isNaN(modSc)) {
-                this.doTransactionFromDeviceEvents([keyEvent(modSc)]);
-            }
-            return;
-        }
-
-        // Dead keys (accent composition: `^` `¨` on French, all of `' " ` ^ ~` on US-International) and
-        // Unidentified keys must emit NOTHING -- the composed character arrives on the next event. Guard
-        // here, before the scancode fallback below would forward their physical scancode and type a stray
-        // character on the en-US guest (`^` dead key -> `[`).
-        if (evt.key === 'Dead' || evt.key === 'Unidentified') {
-            return;
-        }
-
-        // A single printable character: reproduce it on the en-US-pinned guest the way Guacamole does
-        // (key on the CHARACTER the user meant -- evt.key, already resolved through the client's own
-        // layout -- and send the US scancode + Shift that yields it). Correct for every client layout,
-        // and, unlike a Unicode-keysym injection, correct in terminals too. Gated on unicode mode (the
-        // component enables it); without it the base package keeps its plain physical-scancode default.
-        if (this.keyboardUnicodeMode && evt.key.length === 1) {
-            const mapped = usKey(evt.key);
-            if (mapped) {
-                this.sendUsCharacter(evt, mapped, stripCtrlAlt);
-                return;
-            }
-            // Non-ASCII (accents, currency): no US scancode exists, so inject the Unicode codepoint,
-            // releasing any held Shift/AltGr around it so the guest does not re-shift the injection.
-            // (Dead/Unidentified already returned above.)
-            if (keyEvent && unicodeEvent) {
-                this.sendUnicodeCharacter(evt, stripCtrlAlt);
-            }
-            return;
-        }
-
-        // Non-printable key (Enter, Tab, Backspace, arrows, F-keys, Home/End, ...): its physical
-        // position is layout-independent, so forward the scancode down/up as-is. First reconcile the
-        // guest Shift to the physical Shift: these keys combine with Shift (Shift+Arrow/Home selection)
-        // and must see the real modifier even when a preceding layout-shifted digit lazily released the
-        // guest Shift, or when a preceding shifted symbol left a stray Shift the guest should not apply.
         const sc = scanCode(evt.code);
-        if (keyEvent && !Number.isNaN(sc)) {
-            const events: DeviceEvent[] = [...this.syncGuestShift(evt.shiftKey), keyEvent(sc)];
-            this.doTransactionFromDeviceEvents(events);
+        if (!Number.isNaN(sc)) {
+            this.doTransactionFromDeviceEvents([keyEvent(sc)]);
         }
-    }
-
-    /// Reproduce a printable US-QWERTY character on the en-US-pinned guest (Guacamole's keysym->scancode
-    /// model). Emitted as ONE atomic transaction on keydown: strip any AltGr the client used, reconcile
-    /// the guest Shift to exactly what the US layout needs for this character (lazy -- only the delta
-    /// from the current guest Shift is sent), tap the scancode, then re-press the stripped AltGr. The
-    /// guest Shift is NOT restored to the physical state here: under a continuous Shift-hold that restore
-    /// re-pressed Shift after every layout-shifted digit, and a terminal that honours the live modifier
-    /// stream then read the next digit as its shifted symbol (12345 -> !@#$%). Instead the guest Shift is
-    /// left where the character needed it and reconciled by the NEXT event; the only exception is a
-    /// character that needed Shift while none is physically held ("@"), where the tapped Shift is
-    /// released now so it does not linger. keyup carries nothing (auto-repeat re-fires keydown). Command
-    /// chords (Ctrl+C) keep their modifiers: Ctrl is forwarded by its own key event and never stripped.
-    private sendUsCharacter(evt: KeyboardEvent, mapped: UsKey, stripCtrlAlt: boolean) {
-        if (evt.type !== 'keydown') {
-            return;
-        }
-        const sc = scanCode(mapped.code);
-        if (Number.isNaN(sc)) {
-            return;
-        }
-        const device = this.module.DeviceEvent;
-        const events: DeviceEvent[] = [];
-
-        // Strip only the Ctrl/Alt side(s) actually held (from the tracked mirror), never a hardcoded
-        // four -- re-pressing a side the user never held would emit a real make code and STRAND it down.
-        const altGrScanCodes = stripCtrlAlt ? this.heldCtrlAltScanCodes() : [];
-        for (const modSc of altGrScanCodes) {
-            events.push(device.keyReleased(modSc));
-        }
-
-        // Reconcile the guest Shift to what THIS character needs and tap the key. Then leave the guest
-        // Shift where it is (lazy) -- the next event reconciles it -- EXCEPT when no Shift is physically
-        // held: release the Shift we just tapped so a symbol like "@" (Shift+Digit2 on US, produced with
-        // no physical Shift) does not leave a stray Shift down. When Shift IS physically held it is never
-        // re-pressed after the key: across a continuous number-row hold the first digit releases the
-        // guest Shift and it stays released, so a modifier-honouring terminal never sees a per-digit
-        // Shift toggle; a following capital re-presses it (reconcile), a following digit leaves it down-
-        // free. This is the digit-terminal fix AND keeps Shift+letter / capitals mid-hold correct.
-        events.push(...this.syncGuestShift(mapped.shift));
-        events.push(device.keyPressed(sc));
-        events.push(device.keyReleased(sc));
-        if (!evt.shiftKey) {
-            events.push(...this.syncGuestShift(false));
-        }
-
-        for (const modSc of altGrScanCodes) {
-            events.push(device.keyPressed(modSc));
-        }
-        this.doTransactionFromDeviceEvents(events);
-    }
-
-    /// Fallback for a non-ASCII printable character (accent, currency) that the en-US layout cannot
-    /// produce with a scancode: inject the Unicode codepoint. A Shift held on the guest would be
-    /// re-applied to the injected keysym and corrupt it, so reconcile the guest Shift to released for the
-    /// injection and leave it released (lazy) -- the next key reconciles it back if Shift is still held.
-    /// Any AltGr the client used is stripped around the injection and restored (Ctrl/Alt are not lazy).
-    private sendUnicodeCharacter(evt: KeyboardEvent, stripCtrlAlt: boolean) {
-        const device = this.module.DeviceEvent;
-        const unicode = evt.type === 'keydown' ? device.unicodePressed : device.unicodeReleased;
-        const events: DeviceEvent[] = [];
-
-        const altGrScanCodes = stripCtrlAlt && evt.type === 'keydown' ? this.heldCtrlAltScanCodes() : [];
-
-        for (const modSc of altGrScanCodes) {
-            events.push(device.keyReleased(modSc));
-        }
-        if (evt.type === 'keydown') {
-            events.push(...this.syncGuestShift(false));
-        }
-        events.push(unicode(evt.key));
-        for (const modSc of altGrScanCodes) {
-            events.push(device.keyPressed(modSc));
-        }
-        this.doTransactionFromDeviceEvents(events);
     }
 
     private setCursorStyleCallback(
@@ -598,92 +511,6 @@ export class RemoteDesktopService {
         // case in evt.key -> mapped.shift (explicit Shift for capitals), so mirroring the client's Caps
         // onto the guest would apply case a SECOND time and invert every letter. Num/Scroll/Kana sync.
         this.session?.synchronizeLockKeys(syncScrollLockActive, syncNumsLockActive, false, syncKanaModeActive);
-    }
-
-    /// Reconcile the GUEST's Shift to `desired`, returning only the delta and updating guestShiftScanCode.
-    /// Pressing uses the physically-held Shift side (so a later physical keyup releases the SAME scancode,
-    /// never stranding a side), or ShiftLeft when none is held (e.g. tapping Shift for "@"). Releasing
-    /// drops whatever the guest currently holds. Never restores eagerly: the caller leaves the guest
-    /// Shift in the reconciled state, so a continuous number-row hold releases Shift once instead of
-    /// churning it per digit -- the terminal digit fix. Guacamole's guest-side modifier reconciliation.
-    private syncGuestShift(desired: boolean): DeviceEvent[] {
-        const device = this.module.DeviceEvent;
-        const events: DeviceEvent[] = [];
-        if (desired && this.guestShiftScanCode === null) {
-            const held = this.heldShiftScanCodes();
-            const sc = held.length > 0 ? held[0] : scanCode('ShiftLeft');
-            if (!Number.isNaN(sc)) {
-                events.push(device.keyPressed(sc));
-                this.guestShiftScanCode = sc;
-            }
-        } else if (!desired && this.guestShiftScanCode !== null) {
-            events.push(device.keyReleased(this.guestShiftScanCode));
-            this.guestShiftScanCode = null;
-        }
-        return events;
-    }
-
-    /// Whether the client physically holds a Shift (either side), from the tracked mirror.
-    private isPhysicalShiftHeld(): boolean {
-        return (
-            this.modifierKeyPressed.indexOf(ModifierKey.SHIFT_LEFT) !== -1 ||
-            this.modifierKeyPressed.indexOf(ModifierKey.SHIFT_RIGHT) !== -1
-        );
-    }
-
-    /// Windows scancodes for the Shift key(s) currently held down, as tracked in
-    /// modifierKeyPressed (i.e. the ones the client physically holds). Used to pick which Shift side to
-    /// press when reconciling the guest Shift so the eventual physical keyup releases the same scancode.
-    private heldShiftScanCodes(): number[] {
-        const codes: number[] = [];
-        for (const [modifier, keyCode] of [
-            [ModifierKey.SHIFT_LEFT, 'ShiftLeft'],
-            [ModifierKey.SHIFT_RIGHT, 'ShiftRight'],
-        ] as const) {
-            if (this.modifierKeyPressed.indexOf(modifier) !== -1) {
-                const sc = scanCode(keyCode);
-                if (!Number.isNaN(sc)) {
-                    codes.push(sc);
-                }
-            }
-        }
-        return codes;
-    }
-
-    /// Windows scancodes for the Ctrl/Alt key(s) currently held down, tracked in modifierKeyPressed --
-    /// the ones we actually pressed on the guest. Strip AltGr around a character using ONLY these, so a
-    /// Ctrl/Alt side the user never held is never re-pressed and stranded.
-    private heldCtrlAltScanCodes(): number[] {
-        const codes: number[] = [];
-        for (const [modifier, keyCode] of [
-            [ModifierKey.CTRL_LEFT, 'ControlLeft'],
-            [ModifierKey.CTRL_RIGHT, 'ControlRight'],
-            [ModifierKey.ALT_LEFT, 'AltLeft'],
-            [ModifierKey.ALT_RIGHT, 'AltRight'],
-        ] as const) {
-            if (this.modifierKeyPressed.indexOf(modifier) !== -1) {
-                const sc = scanCode(keyCode);
-                if (!Number.isNaN(sc)) {
-                    codes.push(sc);
-                }
-            }
-        }
-        return codes;
-    }
-
-    private updateModifierKeyState(evt: KeyboardEvent) {
-        const modKey: ModifierKey = ModifierKey[evt.code as keyof typeof ModifierKey];
-        const idx = this.modifierKeyPressed.indexOf(modKey);
-
-        // Gate on event type: a lone keyup with no prior keydown (focus gained mid-hold) must NOT seed a
-        // phantom "held" entry -- a phantom would later be re-pressed and strand the modifier down.
-        if (evt.type === 'keydown') {
-            if (idx === -1) {
-                this.modifierKeyPressed.push(modKey);
-            }
-        } else if (evt.type === 'keyup' && idx !== -1) {
-            this.modifierKeyPressed.splice(idx, 1);
-        }
     }
 
     private doTransactionFromDeviceEvents(deviceEvents: DeviceEvent[]) {
