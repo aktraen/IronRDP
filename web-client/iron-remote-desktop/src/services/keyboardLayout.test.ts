@@ -22,6 +22,7 @@ import { scanCode } from '../lib/scancodes';
 const KEY_V = scanCode('KeyV');
 const KEY_C = scanCode('KeyC');
 const KEY_A = scanCode('KeyA');
+const KEY_B = scanCode('KeyB');
 const KEY_T = scanCode('KeyT');
 const DIGIT1 = scanCode('Digit1');
 const DIGIT2 = scanCode('Digit2');
@@ -34,6 +35,7 @@ const CTRL_R = scanCode('ControlRight');
 const ALT_L = scanCode('AltLeft');
 const ALT_R = scanCode('AltRight');
 const ARROW_LEFT = scanCode('ArrowLeft');
+const ARROW_RIGHT = scanCode('ArrowRight');
 
 class MockInputTransaction {
     addEvent = vi.fn();
@@ -78,6 +80,24 @@ function pressedWith(mod: RemoteDesktopModule, sc: number): boolean {
 }
 function releasedWith(mod: RemoteDesktopModule, sc: number): boolean {
     return (mod.DeviceEvent.keyReleased as ReturnType<typeof vi.fn>).mock.calls.some(([s]) => s === sc);
+}
+
+// Replay every keyPressed/keyReleased in invocation order, tracking the guest Shift state, and report
+// whether Shift is down on the guest at the moment `targetSc` is first PRESSED. This is what decides
+// whether the guest resolves the tapped scancode as its base char/digit or its shifted symbol/capital.
+function shiftDownWhenPressed(mod: RemoteDesktopModule, targetSc: number): boolean {
+    const kp = mod.DeviceEvent.keyPressed as ReturnType<typeof vi.fn>;
+    const kr = mod.DeviceEvent.keyReleased as ReturnType<typeof vi.fn>;
+    const stream: { order: number; down: boolean; sc: number }[] = [];
+    kp.mock.calls.forEach(([sc], i) => stream.push({ order: kp.mock.invocationCallOrder[i], down: true, sc }));
+    kr.mock.calls.forEach(([sc], i) => stream.push({ order: kr.mock.invocationCallOrder[i], down: false, sc }));
+    stream.sort((a, b) => a.order - b.order);
+    let shift = 0;
+    for (const e of stream) {
+        if (e.sc === SHIFT_L || e.sc === SHIFT_R) shift += e.down ? 1 : -1;
+        else if (e.down && e.sc === targetSc) return shift > 0;
+    }
+    return false;
 }
 
 describe('US-keymap character production (Guacamole model)', () => {
@@ -167,6 +187,41 @@ describe('US-keymap character production (Guacamole model)', () => {
         // The invariant that kills the corruption: Shift is NEVER pressed by the character path.
         expect(pressedWith(mod, SHIFT_L)).toBe(false);
         expect(pressedWith(mod, SHIFT_R)).toBe(false);
+        expect(mod.DeviceEvent.unicodePressed).not.toHaveBeenCalled();
+    });
+
+    it('CONTINUOUS hold "1A" -> "1A" (regression): digit releases guest Shift, capital A re-presses it', () => {
+        // The lazy release must NOT break the very next capital. Under one continuous Shift hold, "1"
+        // releases the guest Shift (so it is a digit, not "!"), then "A" -- which takes the equal path
+        // (mapped.shift === shiftKey, both true) -- must reconcile the guest Shift back UP so it lands as
+        // a capital, not "a". A naive "release and never re-press" regresses this to "1a".
+        key('ShiftLeft', 'Shift', { shiftKey: true }); // physical Shift down (recorded in the stream)
+        key('Digit1', '1', { shiftKey: true });
+        key('KeyA', 'A', { shiftKey: true });
+        expect(shiftDownWhenPressed(mod, DIGIT1)).toBe(false); // "1", not "!"
+        expect(shiftDownWhenPressed(mod, KEY_A)).toBe(true); // "A", not "a"
+    });
+
+    it('CONTINUOUS hold "A1B" -> "A1B" (regression): capital, digit, capital across one Shift hold', () => {
+        key('ShiftLeft', 'Shift', { shiftKey: true });
+        key('KeyA', 'A', { shiftKey: true });
+        key('Digit1', '1', { shiftKey: true });
+        key('KeyB', 'B', { shiftKey: true });
+        expect(shiftDownWhenPressed(mod, KEY_A)).toBe(true); // "A"
+        expect(shiftDownWhenPressed(mod, DIGIT1)).toBe(false); // "1"
+        expect(shiftDownWhenPressed(mod, KEY_B)).toBe(true); // "B" (guest Shift re-pressed after the digit)
+    });
+
+    it('"12345" then Shift+ArrowRight (same hold) selects: guest Shift is down when the arrow lands', () => {
+        // After a digit run lazily released the guest Shift, a navigation key must reconcile the guest
+        // Shift back to the physical state so Shift+Arrow/Home selection still works.
+        key('ShiftLeft', 'Shift', { shiftKey: true });
+        for (const [c, k] of [['Digit1', '1'], ['Digit2', '2'], ['Digit3', '3'], ['Digit4', '4'], ['Digit5', '5']] as const) {
+            key(c, k, { shiftKey: true });
+        }
+        key('ArrowRight', 'ArrowRight', { shiftKey: true });
+        expect(shiftDownWhenPressed(mod, DIGIT1)).toBe(false); // digits stayed digits
+        expect(shiftDownWhenPressed(mod, ARROW_RIGHT)).toBe(true); // arrow is shifted -> selection
         expect(mod.DeviceEvent.unicodePressed).not.toHaveBeenCalled();
     });
 
