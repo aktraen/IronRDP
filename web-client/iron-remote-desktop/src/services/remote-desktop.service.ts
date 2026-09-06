@@ -256,27 +256,82 @@ export class RemoteDesktopService {
         }
     }
 
-    rotation_unit_from_wheel_event(event: WheelEvent): RotationUnit {
+    // Wheel events are quantized into whole notches before they reach the RDP session. xrdp
+    // turns EVERY wheel PDU into one X11 button-4/5 click regardless of the rotation amount, and
+    // Windows scrolls one line-set per WHEEL_DELTA (120), so forwarding one PDU per DOM event
+    // (a Mac trackpad or mouse emits dozens of small-delta events per gesture) made the guest
+    // scroll many times further than the host gesture. Mirrors guacamole-common-js Mouse.js:
+    // deltas are converted to pixels (line = 18 px, page = 288 px); a single event of at least
+    // WHEEL_NOTCH_MIN_PX is a discrete notch source (one notch per WHEEL_NOTCH_PX, at least one);
+    // smaller deltas accumulate per axis and emit one notch per WHEEL_ACCUMULATE_PX, after which
+    // the remainder is dropped. Every notch is exactly one WHEEL_DELTA.
+    static readonly WHEEL_DELTA = 120;
+    static readonly WHEEL_NOTCH_PX = 100;
+    static readonly WHEEL_NOTCH_MIN_PX = 40;
+    static readonly WHEEL_ACCUMULATE_PX = 53;
+    static readonly WHEEL_PIXELS_PER_LINE = 18;
+    static readonly WHEEL_PIXELS_PER_PAGE = 18 * 16;
+    private wheelAccumulator = { vertical: 0, horizontal: 0 };
+
+    wheelDeltaToPixels(event: WheelEvent, delta: number): number {
         switch (event.deltaMode) {
-            case event.DOM_DELTA_PIXEL:
-                return RotationUnit.Pixel;
-            case event.DOM_DELTA_LINE:
-                return RotationUnit.Line;
-            case event.DOM_DELTA_PAGE:
-                return RotationUnit.Page;
+            case 1: // DOM_DELTA_LINE
+                return delta * RemoteDesktopService.WHEEL_PIXELS_PER_LINE;
+            case 2: // DOM_DELTA_PAGE
+                return delta * RemoteDesktopService.WHEEL_PIXELS_PER_PAGE;
             default:
-                return RotationUnit.Pixel;
+                return delta;
         }
     }
 
-    mouseWheel(event: WheelEvent) {
-        const vertical = event.deltaY !== 0;
-        const rotation = vertical ? event.deltaY : event.deltaX;
-        const rotation_unit = this.rotation_unit_from_wheel_event(event);
+    private wheelNotches(axis: 'vertical' | 'horizontal', px: number): number {
+        if (px === 0) {
+            return 0;
+        }
+        const magnitude = Math.abs(px);
+        const sign = Math.sign(px);
+        if (magnitude >= RemoteDesktopService.WHEEL_NOTCH_MIN_PX) {
+            this.wheelAccumulator[axis] = 0;
+            return sign * Math.max(1, Math.round(magnitude / RemoteDesktopService.WHEEL_NOTCH_PX));
+        }
+        let acc = this.wheelAccumulator[axis] + px;
+        let notches = 0;
+        while (Math.abs(acc) >= RemoteDesktopService.WHEEL_ACCUMULATE_PX) {
+            notches += Math.sign(acc);
+            acc -= Math.sign(acc) * RemoteDesktopService.WHEEL_ACCUMULATE_PX;
+        }
+        this.wheelAccumulator[axis] = notches === 0 ? acc : 0;
+        return notches;
+    }
 
-        this.doTransactionFromDeviceEvents([
-            this.module.DeviceEvent.wheelRotations(vertical, -rotation, rotation_unit),
-        ]);
+    mouseWheel(event: WheelEvent) {
+        const events: DeviceEvent[] = [];
+        // RDP: positive vertical rotation = wheel rotated away from the user = scroll UP, so DOM
+        // deltaY > 0 (scroll down) becomes -WHEEL_DELTA. Horizontal: positive = scroll RIGHT, which
+        // is DOM deltaX > 0, so the sign is kept.
+        const vertical = this.wheelNotches('vertical', this.wheelDeltaToPixels(event, event.deltaY));
+        for (let i = 0; i < Math.abs(vertical); i++) {
+            events.push(
+                this.module.DeviceEvent.wheelRotations(
+                    true,
+                    -Math.sign(vertical) * RemoteDesktopService.WHEEL_DELTA,
+                    RotationUnit.Pixel,
+                ),
+            );
+        }
+        const horizontal = this.wheelNotches('horizontal', this.wheelDeltaToPixels(event, event.deltaX));
+        for (let i = 0; i < Math.abs(horizontal); i++) {
+            events.push(
+                this.module.DeviceEvent.wheelRotations(
+                    false,
+                    Math.sign(horizontal) * RemoteDesktopService.WHEEL_DELTA,
+                    RotationUnit.Pixel,
+                ),
+            );
+        }
+        if (events.length > 0) {
+            this.doTransactionFromDeviceEvents(events);
+        }
     }
 
     emitWarningEvent(data: string): void {
