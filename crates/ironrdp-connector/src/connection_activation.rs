@@ -619,10 +619,14 @@ fn create_client_confirm_active(
             }),
             CapabilitySet::BitmapCodecs(bitmap_codecs.expect("checked by enable_surface_commands")),
             CapabilitySet::FrameAcknowledge(FrameAcknowledge {
-                // FIXME(#447): Revert this to 2 per FreeRDP.
-                // This is a temporary hack to fix a resize bug, see:
-                // https://github.com/Devolutions/IronRDP/issues/447
-                max_unacknowledged_frame_count: 20,
+                // aktraen: 2, FreeRDP's (and thus guacd's) value. Upstream advertises 20 as a
+                // workaround for a live-resize bug (#447) that this client never hits because
+                // learn reconnects at the new size instead of resizing in place. xrdp copies this
+                // straight into its encoder's frames_in_flight, so 20 let it run up to twenty
+                // full-screen frames ahead of what the browser had decoded and drawn: a multi-MB
+                // backlog that made scrolling lag the gesture. With 2, xorgxrdp coalesces dirty
+                // regions while it waits and the browser only ever decodes near-current frames.
+                max_unacknowledged_frame_count: 2,
             }),
         ]);
     }
@@ -862,7 +866,7 @@ mod tests {
         assert!(confirm.pdu.capability_sets.iter().any(|capability| matches!(
             capability,
             CapabilitySet::FrameAcknowledge(FrameAcknowledge {
-                max_unacknowledged_frame_count: 20,
+                max_unacknowledged_frame_count: 2,
             })
         )));
     }
