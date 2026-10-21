@@ -45,6 +45,14 @@ export function displayControl(enable: boolean): Extension {
     return new Extension('display_control', enable);
 }
 
+/**
+ * Session query (`invokeExtension`): `true` once the server opened the Display Control channel,
+ * meaning a resize can be applied without reconnecting.
+ */
+export function displayControlReady(): Extension {
+    return new Extension('display_control_ready', true);
+}
+
 export function kdcProxyUrl(url: string): Extension {
     return new Extension('kdc_proxy_url', url);
 }

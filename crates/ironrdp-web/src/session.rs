@@ -1,4 +1,4 @@
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 use core::net::{Ipv4Addr, SocketAddrV4};
 use core::num::NonZeroU32;
 use core::time::Duration;
@@ -105,6 +105,7 @@ struct SessionBuilderInner {
     enable_credssp: bool,
     legacy_graphics: bool,
     outbound_message_size_limit: Option<usize>,
+    canvas_resized_callback: Option<js_sys::Function>,
 }
 
 impl Default for SessionBuilderInner {
@@ -148,6 +149,7 @@ impl Default for SessionBuilderInner {
             enable_credssp: true,
             legacy_graphics: false,
             outbound_message_size_limit: None,
+            canvas_resized_callback: None,
         }
     }
 }
@@ -252,8 +254,9 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
         self.clone()
     }
 
-    /// Because the server does not resize the framebuffer in the RDP protocol, this feature is unused in IronRDP.
-    fn canvas_resized_callback(&self, _callback: js_sys::Function) -> Self {
+    /// Called after a Deactivation-Reactivation Sequence resizes the canvas to the server's desktop size.
+    fn canvas_resized_callback(&self, callback: js_sys::Function) -> Self {
+        self.0.borrow_mut().canvas_resized_callback = Some(callback);
         self.clone()
     }
 
@@ -373,6 +376,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             printer_driver_name,
             outbound_message_size_limit,
             legacy_graphics,
+            canvas_resized_callback,
         );
 
         {
@@ -416,6 +420,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             printer_driver_name = inner.printer_driver_name.clone();
             outbound_message_size_limit = inner.outbound_message_size_limit;
             legacy_graphics = inner.legacy_graphics;
+            canvas_resized_callback = inner.canvas_resized_callback.clone();
         }
 
         if pcb.is_some() && vmconnect.is_some() {
@@ -548,6 +553,8 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             connection_result: RefCell::new(Some(connection_result)),
             clipboard: RefCell::new(Some(clipboard)),
             printer: RefCell::new(Some(printer)),
+            display_control_ready: Cell::new(false),
+            canvas_resized_callback,
         })
     }
 }
@@ -597,6 +604,9 @@ pub(crate) struct Session {
     rdp_reader: RefCell<Option<ReadHalf<WebSocket>>>,
     clipboard: RefCell<Option<Option<WasmClipboard>>>,
     printer: RefCell<Option<Option<WasmPrinter>>>,
+
+    display_control_ready: Cell<bool>,
+    canvas_resized_callback: Option<js_sys::Function>,
 }
 
 impl Session {
@@ -695,8 +705,6 @@ impl iron_remote_desktop::Session for Session {
             connection_result.desktop_size.height,
         );
 
-        let mut requested_resize = None;
-
         // Reused across frames so per-region extraction doesn't allocate on every draw.
         let mut draw_buffer = WriteBuf::new();
 
@@ -719,6 +727,9 @@ impl iron_remote_desktop::Session for Session {
         let mut cleanup_interval = IntervalStream::new(5_000).fuse();
 
         let disconnect_reason = 'outer: loop {
+            self.display_control_ready
+                .set(active_stage.display_control_ready() == Some(true));
+
             let outputs = select! {
                 frame = framed.read_pdu().fuse() => {
                     let (action, payload) = frame.context("read frame")?;
@@ -876,10 +887,6 @@ impl iron_remote_desktop::Session for Session {
                                 warn!("Resize event ignored: width or height is zero");
                                 Vec::new()
                             } else if let Some(response_frame) = active_stage.encode_resize(width, height, scale_factor, physical_size) {
-                                let width = NonZeroU32::new(width).expect("width is guaranteed to be non-zero due to the prior check");
-                                let height = NonZeroU32::new(height).expect("height is guaranteed to be non-zero due to the prior check");
-
-                                requested_resize = Some((width, height));
                                 vec![ActiveStageOutput::ResponseFrame(response_frame?)]
                             } else {
                                 debug!("Resize event ignored");
@@ -1054,13 +1061,9 @@ impl iron_remote_desktop::Session for Session {
                         // https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/dfc234ce-481a-4674-9a5d-2a7bafb14432
                         debug!("Received Server Deactivate All PDU, executing Deactivation-Reactivation Sequence");
 
-                        // We need to perform resize after receiving the Deactivate All PDU, because there may be frames
-                        // with the previous dimensions arriving between the resize request and this message.
-                        if let Some((width, height)) = requested_resize {
-                            gui.resize(width, height);
-                            requested_resize = None;
-                        }
-
+                        // The canvas is resized once the sequence completes, to the size the server
+                        // announced, and the page is told in the same step so it never shows the old
+                        // frame stretched to the new backing size.
                         let mut connection_activation = activation_factory.create();
                         let mut buf = WriteBuf::new();
                         'activation_seq: loop {
@@ -1086,6 +1089,19 @@ impl iron_remote_desktop::Session for Session {
                             {
                                 debug!("Deactivation-Reactivation Sequence completed");
                                 image = DecodedImage::new(PixelFormat::RgbA32, desktop_size.width, desktop_size.height);
+                                // The server may settle on a size other than the one requested
+                                // (or resize on its own), so the canvas follows what it announced.
+                                if let (Some(width), Some(height)) = (
+                                    NonZeroU32::new(u32::from(desktop_size.width)),
+                                    NonZeroU32::new(u32::from(desktop_size.height)),
+                                ) {
+                                    gui.resize(width, height);
+                                }
+                                if let Some(callback) = &self.canvas_resized_callback {
+                                    if let Err(error) = callback.call0(&JsValue::NULL) {
+                                        warn!(?error, "canvas resized callback failed");
+                                    }
+                                }
                                 if !active_stage.reactivate(
                                     connection_activation.io_channel_id(),
                                     connection_activation.user_channel_id(),
@@ -1225,6 +1241,10 @@ impl iron_remote_desktop::Session for Session {
         // to keep the iron-remote-desktop trait surface protocol-agnostic.
         iron_remote_desktop::extension_match! {
             match ext;
+            |display_control_ready: JsValue| {
+                let _ = display_control_ready;
+                return Ok(JsValue::from_bool(self.display_control_ready.get()));
+            };
             |request_file_contents: JsValue| {
                 let obj = into_object(request_file_contents)?;
                 let stream_id = get_u32(&obj, "stream_id")?;

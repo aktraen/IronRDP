@@ -24,6 +24,7 @@
     import { isComponentDestroyed } from './lib/stores/componentLifecycleStore';
     import { runWhenFocusedQueue } from './lib/stores/runWhenFocusedStore';
     import { ClipboardService } from './services/clipboard.service';
+    import { GuestResizeScheduler, type GuestSize } from './lib/guestResize';
 
     let {
         scale,
@@ -31,12 +32,14 @@
         flexcenter,
         module,
         dynamicresize,
+        dynamicresizemax,
     }: {
         scale: string;
         verbose: 'true' | 'false';
         flexcenter: string;
         module: RemoteDesktopModule;
         dynamicresize?: string;
+        dynamicresizemax?: string;
     } = $props();
 
     let isVisible = $state(false);
@@ -85,7 +88,10 @@
             return;
         }
         setWrapperStyle('100%', '100%', 'hidden');
-        setTimeout(() => scaleSession(scale), 150);
+        setTimeout(() => {
+            scaleSession(scale);
+            scheduleGuestResize();
+        }, 150);
     }
 
     function resetHostStyle() {
@@ -125,28 +131,32 @@
     }
 
     let containerResizeObserver: ResizeObserver | undefined;
-    let dynamicResizeTimer: ReturnType<typeof setTimeout> | undefined;
+    let sessionStarted = false;
+    const guestResize = new GuestResizeScheduler((size) => remoteDesktopService.resizeDynamic(size.width, size.height));
 
     function evenClamp(value: number, min: number, max: number): number {
         const clamped = Math.max(min, Math.min(max, Math.floor(value)));
         return clamped % 2 === 0 ? clamped : clamped - 1;
     }
 
-    function requestGuestResize() {
-        const { x, y } = getContainerSize();
-        const width = evenClamp(x, 200, 8192);
-        const height = evenClamp(y, 200, 8192);
-        if (width > 0 && height > 0 && (width !== canvas.width || height !== canvas.height)) {
-            remoteDesktopService.resizeDynamic(width, height);
-        }
+    function dynamicResizeMax(): GuestSize {
+        const match = /^(\d+)x(\d+)$/.exec(dynamicresizemax ?? '');
+        return match ? { width: Number(match[1]), height: Number(match[2]) } : { width: 8192, height: 8192 };
     }
 
+    // Live resize, as guacd's display-update does: the guest is asked for the container size over the
+    // open session (Display Control) while the current frame stays fitted, never stretched. A hidden
+    // (zero-size) host asks for nothing, so minimizing a window never resizes the guest.
     function scheduleGuestResize() {
-        if (dynamicresize !== 'true' || !isVisible) {
+        const hostSize = getHostSize();
+        if (dynamicresize !== 'true' || !isVisible || !sessionStarted || hostSize === null) {
             return;
         }
-        clearTimeout(dynamicResizeTimer);
-        dynamicResizeTimer = setTimeout(requestGuestResize, 150);
+        const max = dynamicResizeMax();
+        guestResize.update(
+            { width: evenClamp(hostSize.x, 200, max.width), height: evenClamp(hostSize.y, 200, max.height) },
+            { width: canvas.width, height: canvas.height },
+        );
     }
 
     const resizeHandler = (_evt: UIEvent) => {
@@ -172,7 +182,9 @@
             loggingService.info(`Resize canvas to: ${evt.desktopSize.width}x${evt.desktopSize.height}`);
             canvas.width = evt.desktopSize.width;
             canvas.height = evt.desktopSize.height;
+            sessionStarted = true;
             scaleSession(scale);
+            scheduleGuestResize();
         });
     }
 
@@ -195,23 +207,27 @@
             if (val) {
                 //Enforce first scaling and delay the call to scaleSession to ensure Dom is ready.
                 setWrapperStyle('100%', '100%', 'hidden');
-                setTimeout(() => scaleSession(scale), 150);
+                setTimeout(() => {
+                    scaleSession(scale);
+                    scheduleGuestResize();
+                }, 150);
             }
         });
     }
 
     function canvasResized() {
+        guestResize.guestResized({ width: canvas.width, height: canvas.height });
         scaleSession(currentScreenScale);
+        scheduleGuestResize();
     }
 
     function scaleSession(screenScale: ScreenScale | string) {
         resetHostStyle();
         if (isVisible) {
             if (dynamicresize === 'true') {
-                const fillSize = getContainerSize();
-                setWrapperStyle('initial', 'initial', 'hidden');
-                setViewerStyle(`${fillSize.y}px`, `${fillSize.x}px`, true);
-                setHostStyle(false);
+                // Until the guest answers with the container size, fit the frame it has (aspect kept).
+                currentScreenScale = ScreenScale.Fit;
+                fitResize();
                 return;
             }
             switch (screenScale) {
@@ -351,13 +367,17 @@
         return { x, y };
     }
 
-    function getContainerSize() {
+    function getHostSize(): { x: number; y: number } | null {
         const root = wrapper?.getRootNode?.() as ShadowRoot | Document | undefined;
         const hostEl = root && 'host' in root ? (root.host as HTMLElement) : undefined;
         if (hostEl && hostEl.clientWidth > 0 && hostEl.clientHeight > 0) {
             return { x: hostEl.clientWidth, y: hostEl.clientHeight };
         }
-        return getWindowSize();
+        return null;
+    }
+
+    function getContainerSize() {
+        return getHostSize() ?? getWindowSize();
     }
 
     async function initcanvas() {
@@ -423,7 +443,7 @@
         document.removeEventListener('visibilitychange', visibilityChangeHandler);
         document.removeEventListener('fullscreenchange', fullscreenChangeHandler);
         containerResizeObserver?.disconnect();
-        clearTimeout(dynamicResizeTimer);
+        guestResize.dispose();
         isComponentDestroyed.set(true);
     });
 </script>

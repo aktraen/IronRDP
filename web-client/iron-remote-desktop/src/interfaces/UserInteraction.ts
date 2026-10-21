@@ -45,7 +45,8 @@ export interface UserInteraction {
 
     pasteClipboardText(text: string): Promise<void>;
 
-    invokeExtension(ext: Extension): void;
+    /** Runs a session extension and returns its result (`undefined` before the session exists). */
+    invokeExtension(ext: Extension): unknown;
 
     /**
      * Enable file transfer support. Must be called before connect().
