@@ -613,6 +613,37 @@ impl<'de> Decode<'de> for RailPdu {
     }
 }
 
+/// Decodes a server PDU, also accepting a Handshake or HandshakeEx whose `orderLength` counts
+/// only the body.
+///
+/// xrdp sends its Handshake as `05 00 04 00 01 00 00 00`: `orderLength` excludes the 4-byte
+/// header, so [`RailPdu`]'s strict decoder rejects it. Every other order type, and every other
+/// length mismatch, is still rejected.
+pub fn decode_server_pdu_lenient(payload: &[u8]) -> DecodeResult<RailPdu> {
+    let strict_error = match ironrdp_core::decode::<RailPdu>(payload) {
+        Ok(pdu) => return Ok(pdu),
+        Err(error) => error,
+    };
+
+    let mut src = ReadCursor::new(payload);
+    let Ok(header) = RailPduHeader::decode(&mut src) else {
+        return Err(strict_error);
+    };
+    let body_only_length = usize::from(header.order_length).checked_add(HEADER_SIZE);
+    if !matches!(header.order_type, RailOrderType::Handshake | RailOrderType::HandshakeEx)
+        || body_only_length != Some(payload.len())
+    {
+        return Err(strict_error);
+    }
+
+    let mut body = ReadCursor::new(src.read_remaining());
+    let pdu = decode_body(header.order_type, &mut body)?;
+    if !body.is_empty() {
+        return Err(invalid_field_err!("orderLength", "trailing bytes after RAIL PDU body"));
+    }
+    Ok(pdu)
+}
+
 /// Handshake PDU ([MS-RDPERP] 2.2.2.2.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HandshakePdu {
@@ -2482,6 +2513,62 @@ mod tests {
         // An Execute PDU with an odd ExeOrFileLength is invalid UTF-16.
         assert!(decode::<RailPdu>(&[0x01, 0x00, 0x0D, 0x00, 0, 0, 1, 0, 0, 0, 0, 0, 0]).is_err());
         assert!(decode::<RailPdu>(&[0x15, 0x00, 0x09, 0x00, 0, 0, 0, 0, 2]).is_err());
+    }
+
+    const XRDP_HANDSHAKE: [u8; 8] = [0x05, 0x00, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00];
+
+    #[test]
+    fn lenient_decode_accepts_xrdp_handshake() {
+        assert!(decode::<RailPdu>(&XRDP_HANDSHAKE).is_err());
+        assert_eq!(
+            decode_server_pdu_lenient(&XRDP_HANDSHAKE).unwrap(),
+            RailPdu::Handshake(HandshakePdu { build_number: 1 })
+        );
+
+        let handshake_ex = [0x13, 0x00, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00];
+        assert!(decode::<RailPdu>(&handshake_ex).is_err());
+        assert_eq!(
+            decode_server_pdu_lenient(&handshake_ex).unwrap(),
+            RailPdu::HandshakeEx(HandshakeExPdu {
+                build_number: 1,
+                flags: HandshakeExPdu::EXTENDED_SPI,
+            })
+        );
+
+        let strict = encode_vec(&RailPdu::Handshake(HandshakePdu { build_number: 7601 })).unwrap();
+        assert_eq!(
+            decode_server_pdu_lenient(&strict).unwrap(),
+            decode::<RailPdu>(&strict).unwrap()
+        );
+    }
+
+    #[test]
+    fn lenient_decode_keeps_rejecting_invalid_lengths() {
+        assert!(decode_server_pdu_lenient(&[0x05, 0x00, 0x03, 0x00, 1, 0, 0, 0]).is_err());
+        assert!(decode_server_pdu_lenient(&[0x05, 0x00, 0x05, 0x00, 1, 0, 0, 0]).is_err());
+        assert!(decode_server_pdu_lenient(&[0x05, 0x00, 0x09, 0x00, 1, 0, 0, 0]).is_err());
+        assert!(decode_server_pdu_lenient(&[0x05, 0x00, 0x04, 0x00, 1, 0, 0, 0, 0]).is_err());
+        assert!(decode_server_pdu_lenient(&[0x05, 0x00, 0x04, 0x00]).is_err());
+        assert!(decode_server_pdu_lenient(&[0x13, 0x00, 0x04, 0x00, 1, 0, 0, 0]).is_err());
+        assert!(decode_server_pdu_lenient(&[0x05, 0x00]).is_err());
+    }
+
+    #[test]
+    fn lenient_decode_is_handshake_only() {
+        let mut execute_result = encode_vec(&RailPdu::ExecuteResult(ExecuteResultPdu {
+            flags: 0,
+            result: ExecuteResult::Ok,
+            raw_result: 0,
+            executable: "app".into(),
+        }))
+        .unwrap();
+        let body_only = u16::try_from(execute_result.len() - 4).unwrap();
+        execute_result[2..4].copy_from_slice(&body_only.to_le_bytes());
+        assert!(decode::<RailPdu>(&execute_result).is_err());
+        assert!(decode_server_pdu_lenient(&execute_result).is_err());
+
+        let zorder = [0x14, 0x00, 0x04, 0x00, 7, 0, 0, 0];
+        assert!(decode_server_pdu_lenient(&zorder).is_err());
     }
 
     #[test]
