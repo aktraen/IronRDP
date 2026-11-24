@@ -5,7 +5,7 @@
 //!
 //! [MS-RDPERP]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdperp
 
-use ironrdp_core::{DecodeResult, ReadCursor, ensure_size, invalid_field_err};
+use ironrdp_core::{DecodeResult, EncodeResult, ReadCursor, ensure_size, invalid_field_err};
 
 const WINDOWING_ORDER_CONTROL_FLAGS: u8 = 0x2e;
 const ALTERNATE_SECONDARY_HEADER_SIZE: usize = 1 /* controlFlags */ + 2 /* orderSize */;
@@ -420,6 +420,583 @@ fn decode_orders<'a>(src: &mut ReadCursor<'a>, order_count: usize) -> DecodeResu
     })
 }
 
+const FIELD_APPBAR_EDGE: u32 = 0x0000_0001;
+const FIELD_OWNER: u32 = 0x0000_0002;
+const FIELD_TITLE: u32 = 0x0000_0004;
+const FIELD_STYLE: u32 = 0x0000_0008;
+const FIELD_SHOW: u32 = 0x0000_0010;
+const FIELD_APPBAR_STATE: u32 = 0x0000_0040;
+const FIELD_RESIZE_MARGIN_X: u32 = 0x0000_0080;
+const FIELD_WND_RECTS: u32 = 0x0000_0100;
+const FIELD_VISIBILITY: u32 = 0x0000_0200;
+const FIELD_WND_SIZE: u32 = 0x0000_0400;
+const FIELD_WND_OFFSET: u32 = 0x0000_0800;
+const FIELD_VIS_OFFSET: u32 = 0x0000_1000;
+const FIELD_CLIENT_AREA_OFFSET: u32 = 0x0000_4000;
+const FIELD_WND_CLIENT_DELTA: u32 = 0x0000_8000;
+const FIELD_CLIENT_AREA_SIZE: u32 = 0x0001_0000;
+const FIELD_RP_CONTENT: u32 = 0x0002_0000;
+const FIELD_ROOT_PARENT: u32 = 0x0004_0000;
+const FIELD_ENFORCE_SERVER_ZORDER: u32 = 0x0008_0000;
+const FIELD_OVERLAY_DESCRIPTION: u32 = 0x0040_0000;
+const FIELD_TASKBAR_BUTTON: u32 = 0x0080_0000;
+const FIELD_RESIZE_MARGIN_Y: u32 = 0x0800_0000;
+const STATE_NEW: u32 = 0x1000_0000;
+const STATE_DELETED: u32 = 0x2000_0000;
+const FIELD_ICON: u32 = 0x4000_0000;
+const FIELD_CACHED_ICON: u32 = 0x8000_0000;
+
+const DESKTOP_NONE: u32 = 0x0000_0001;
+const DESKTOP_HOOKED: u32 = 0x0000_0002;
+const DESKTOP_ARC_COMPLETED: u32 = 0x0000_0004;
+const DESKTOP_ARC_BEGAN: u32 = 0x0000_0008;
+const DESKTOP_ZORDER: u32 = 0x0000_0010;
+const DESKTOP_ACTIVE_WINDOW: u32 = 0x0000_0020;
+
+/// `GRAPHICS_UPDATE_TYPE_ORDERS`, the first field of a forwarded Orders update.
+const UPDATE_TYPE_ORDERS: u16 = 0x0000;
+
+/// Show state of a RemoteApp window ([MS-RDPERP] 2.2.1.3.1.2.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowShowState {
+    Hidden,
+    Minimized,
+    Maximized,
+    Shown,
+}
+
+impl WindowShowState {
+    fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Hidden),
+            2 => Some(Self::Minimized),
+            3 => Some(Self::Maximized),
+            5 => Some(Self::Shown),
+            _ => None,
+        }
+    }
+
+    const fn as_u8(self) -> u8 {
+        match self {
+            Self::Hidden => 0,
+            Self::Minimized => 2,
+            Self::Maximized => 3,
+            Self::Shown => 5,
+        }
+    }
+}
+
+/// A signed point in virtual desktop coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WindowPoint {
+    pub x: i32,
+    pub y: i32,
+}
+
+/// An unsigned window extent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WindowExtent {
+    pub width: u32,
+    pub height: u32,
+}
+
+/// A `TS_RECTANGLE_16` relative to its window or visible offset; `right` and `bottom` are exclusive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WindowRectangle {
+    pub left: u16,
+    pub top: u16,
+    pub right: u16,
+    pub bottom: u16,
+}
+
+/// A pair of resize margins (left/right or top/bottom).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WindowResizeMargins {
+    pub start: u32,
+    pub end: u32,
+}
+
+/// Window styles as sent by the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WindowStyles {
+    pub style: u32,
+    pub extended_style: u32,
+}
+
+/// A decoded Window Information Order ([MS-RDPERP] 2.2.1.3.1.2.1), new window or update.
+///
+/// Every optional field is `Some` exactly when its `fieldsPresent` flag was set.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WindowInfoOrder {
+    pub window_id: u32,
+    pub is_new: bool,
+    pub owner_window_id: Option<u32>,
+    pub styles: Option<WindowStyles>,
+    pub show_state: Option<WindowShowState>,
+    pub title: Option<String>,
+    pub client_offset: Option<WindowPoint>,
+    pub client_area_size: Option<WindowExtent>,
+    pub horizontal_resize_margins: Option<WindowResizeMargins>,
+    pub vertical_resize_margins: Option<WindowResizeMargins>,
+    pub rp_content: Option<bool>,
+    pub root_parent: Option<u32>,
+    pub window_offset: Option<WindowPoint>,
+    pub client_delta: Option<WindowPoint>,
+    pub window_size: Option<WindowExtent>,
+    pub window_rects: Option<Vec<WindowRectangle>>,
+    pub visible_offset: Option<WindowPoint>,
+    pub visibility_rects: Option<Vec<WindowRectangle>>,
+    pub overlay_description: Option<String>,
+    pub taskbar_button: Option<u8>,
+    pub enforce_server_z_order: Option<u8>,
+    pub app_bar_state: Option<u8>,
+    pub app_bar_edge: Option<u8>,
+}
+
+/// A decoded Desktop Information Order ([MS-RDPERP] 2.2.1.3.3.2).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DesktopInfoOrder {
+    pub non_monitored: bool,
+    pub hooked: bool,
+    pub arc_began: bool,
+    pub arc_completed: bool,
+    pub active_window_id: Option<u32>,
+    pub z_order: Option<Vec<u32>>,
+}
+
+/// A typed Windowing Alternate Secondary Drawing Order.
+///
+/// Icon payloads are validated but not retained: RemoteApp hosts that draw their own chrome do
+/// not need them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecodedWindowingOrder {
+    Window(WindowInfoOrder),
+    WindowDeleted {
+        window_id: u32,
+    },
+    WindowIcon {
+        window_id: u32,
+        cached: bool,
+    },
+    NotifyIcon {
+        window_id: u32,
+        notify_icon_id: u32,
+        deleted: bool,
+    },
+    Desktop(DesktopInfoOrder),
+}
+
+impl WindowingOrder<'_> {
+    /// Decodes the fields of this validated order.
+    pub fn decode_typed(&self) -> DecodeResult<DecodedWindowingOrder> {
+        decode_windowing_order(&mut ReadCursor::new(self.encoded))
+    }
+}
+
+/// Validates and decodes one Windowing Alternate Secondary Drawing Order.
+pub fn decode_windowing_order(src: &mut ReadCursor<'_>) -> DecodeResult<DecodedWindowingOrder> {
+    let order = WindowingOrder::decode(src)?;
+    let mut body = ReadCursor::new(order.encoded);
+    body.advance(ALTERNATE_SECONDARY_HEADER_SIZE + ORDER_FLAGS_SIZE);
+    let flags = order.fields_present;
+    match flags & ORDER_TYPE_MASK {
+        WINDOW_TYPE => decode_window_order(flags, &mut body),
+        NOTIFY_ICON_TYPE => {
+            ensure_size!(in: body, size: 8 /* WindowId, NotifyIconId */);
+            Ok(DecodedWindowingOrder::NotifyIcon {
+                window_id: body.read_u32(),
+                notify_icon_id: body.read_u32(),
+                deleted: flags & STATE_DELETED != 0,
+            })
+        }
+        _ => decode_desktop_order(flags, &mut body).map(DecodedWindowingOrder::Desktop),
+    }
+}
+
+/// Decodes the window orders of a forwarded Orders update.
+///
+/// The payload is the one carried by `ActiveStageOutput::WindowingOrders`: a slow-path Orders
+/// graphics update starting with its `updateType`. Orders outside the windowing subset end the
+/// scan, exactly like [`try_decode_slow_path_windowing_orders`].
+pub fn decode_forwarded_windowing_orders(data: &[u8]) -> DecodeResult<Vec<DecodedWindowingOrder>> {
+    let mut src = ReadCursor::new(data);
+    ensure_size!(in: src, size: 2 /* updateType */);
+    if src.read_u16() != UPDATE_TYPE_ORDERS {
+        return Err(invalid_field_err!("updateType", "expected an Orders update"));
+    }
+    try_decode_slow_path_windowing_orders(&mut src)?
+        .orders
+        .iter()
+        .map(WindowingOrder::decode_typed)
+        .collect()
+}
+
+/// Encodes orders as a forwarded Orders update (the inverse of [`decode_forwarded_windowing_orders`]).
+///
+/// Icon orders cannot be encoded because their payload is not retained when decoding.
+pub fn encode_forwarded_windowing_orders(orders: &[DecodedWindowingOrder]) -> EncodeResult<Vec<u8>> {
+    let count = u16::try_from(orders.len()).map_err(|_| invalid_field_err!("numberOrders", "too many orders"))?;
+    let mut out = Vec::new();
+    out.extend_from_slice(&UPDATE_TYPE_ORDERS.to_le_bytes());
+    out.extend_from_slice(&[0, 0]);
+    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&[0, 0]);
+    for order in orders {
+        out.extend_from_slice(&order.encode_order()?);
+    }
+    Ok(out)
+}
+
+impl DecodedWindowingOrder {
+    /// Encodes this order with its alternate secondary drawing order header.
+    pub fn encode_order(&self) -> EncodeResult<Vec<u8>> {
+        let mut fields = Vec::new();
+        let fields_present = match self {
+            Self::Window(window) => window.encode_fields(&mut fields)?,
+            Self::WindowDeleted { window_id } => {
+                fields.extend_from_slice(&window_id.to_le_bytes());
+                WINDOW_TYPE | STATE_DELETED
+            }
+            Self::Desktop(desktop) => desktop.encode_fields(&mut fields)?,
+            Self::WindowIcon { .. } | Self::NotifyIcon { .. } => {
+                return Err(invalid_field_err!("fieldsPresent", "icon orders are not encodable"));
+            }
+        };
+        let order_size = ALTERNATE_SECONDARY_HEADER_SIZE + ORDER_FLAGS_SIZE + fields.len();
+        let order_size =
+            u16::try_from(order_size).map_err(|_| invalid_field_err!("orderSize", "order does not fit in 64 KiB"))?;
+        let mut out = Vec::with_capacity(usize::from(order_size));
+        out.push(WINDOWING_ORDER_CONTROL_FLAGS);
+        out.extend_from_slice(&order_size.to_le_bytes());
+        out.extend_from_slice(&fields_present.to_le_bytes());
+        out.extend_from_slice(&fields);
+        Ok(out)
+    }
+}
+
+impl WindowInfoOrder {
+    fn encode_fields(&self, out: &mut Vec<u8>) -> EncodeResult<u32> {
+        let mut flags = WINDOW_TYPE;
+        if self.is_new {
+            flags |= STATE_NEW;
+        }
+        out.extend_from_slice(&self.window_id.to_le_bytes());
+        if let Some(owner) = self.owner_window_id {
+            flags |= FIELD_OWNER;
+            out.extend_from_slice(&owner.to_le_bytes());
+        }
+        if let Some(styles) = self.styles {
+            flags |= FIELD_STYLE;
+            out.extend_from_slice(&styles.style.to_le_bytes());
+            out.extend_from_slice(&styles.extended_style.to_le_bytes());
+        }
+        if let Some(show_state) = self.show_state {
+            flags |= FIELD_SHOW;
+            out.push(show_state.as_u8());
+        }
+        if let Some(title) = &self.title {
+            flags |= FIELD_TITLE;
+            encode_unicode(out, title)?;
+        }
+        if let Some(offset) = self.client_offset {
+            flags |= FIELD_CLIENT_AREA_OFFSET;
+            encode_point(out, offset);
+        }
+        if let Some(size) = self.client_area_size {
+            flags |= FIELD_CLIENT_AREA_SIZE;
+            encode_extent(out, size);
+        }
+        if let Some(margins) = self.horizontal_resize_margins {
+            flags |= FIELD_RESIZE_MARGIN_X;
+            encode_margins(out, margins);
+        }
+        if let Some(margins) = self.vertical_resize_margins {
+            flags |= FIELD_RESIZE_MARGIN_Y;
+            encode_margins(out, margins);
+        }
+        if let Some(rp_content) = self.rp_content {
+            flags |= FIELD_RP_CONTENT;
+            out.push(u8::from(rp_content));
+        }
+        if let Some(root_parent) = self.root_parent {
+            flags |= FIELD_ROOT_PARENT;
+            out.extend_from_slice(&root_parent.to_le_bytes());
+        }
+        if let Some(offset) = self.window_offset {
+            flags |= FIELD_WND_OFFSET;
+            encode_point(out, offset);
+        }
+        if let Some(delta) = self.client_delta {
+            flags |= FIELD_WND_CLIENT_DELTA;
+            encode_point(out, delta);
+        }
+        if let Some(size) = self.window_size {
+            flags |= FIELD_WND_SIZE;
+            encode_extent(out, size);
+        }
+        if let Some(rects) = &self.window_rects {
+            flags |= FIELD_WND_RECTS;
+            encode_rectangles(out, rects)?;
+        }
+        if let Some(offset) = self.visible_offset {
+            flags |= FIELD_VIS_OFFSET;
+            encode_point(out, offset);
+        }
+        if let Some(rects) = &self.visibility_rects {
+            flags |= FIELD_VISIBILITY;
+            encode_rectangles(out, rects)?;
+        }
+        if let Some(description) = &self.overlay_description {
+            flags |= FIELD_OVERLAY_DESCRIPTION;
+            encode_unicode(out, description)?;
+        }
+        for (flag, value) in [
+            (FIELD_TASKBAR_BUTTON, self.taskbar_button),
+            (FIELD_ENFORCE_SERVER_ZORDER, self.enforce_server_z_order),
+            (FIELD_APPBAR_STATE, self.app_bar_state),
+            (FIELD_APPBAR_EDGE, self.app_bar_edge),
+        ] {
+            if let Some(value) = value {
+                flags |= flag;
+                out.push(value);
+            }
+        }
+        Ok(flags)
+    }
+}
+
+impl DesktopInfoOrder {
+    fn encode_fields(&self, out: &mut Vec<u8>) -> EncodeResult<u32> {
+        let mut flags = DESKTOP_TYPE;
+        for (flag, set) in [
+            (DESKTOP_NONE, self.non_monitored),
+            (DESKTOP_HOOKED, self.hooked),
+            (DESKTOP_ARC_BEGAN, self.arc_began),
+            (DESKTOP_ARC_COMPLETED, self.arc_completed),
+        ] {
+            if set {
+                flags |= flag;
+            }
+        }
+        if let Some(active) = self.active_window_id {
+            flags |= DESKTOP_ACTIVE_WINDOW;
+            out.extend_from_slice(&active.to_le_bytes());
+        }
+        if let Some(z_order) = &self.z_order {
+            flags |= DESKTOP_ZORDER;
+            out.push(u8::try_from(z_order.len()).map_err(|_| invalid_field_err!("NumWindowIds", "too many windows"))?);
+            for id in z_order {
+                out.extend_from_slice(&id.to_le_bytes());
+            }
+        }
+        Ok(flags)
+    }
+}
+
+fn decode_window_order(flags: u32, src: &mut ReadCursor<'_>) -> DecodeResult<DecodedWindowingOrder> {
+    ensure_size!(in: src, size: 4 /* WindowId */);
+    let window_id = src.read_u32();
+    if flags & STATE_DELETED != 0 {
+        return Ok(DecodedWindowingOrder::WindowDeleted { window_id });
+    }
+    if flags & (FIELD_ICON | FIELD_CACHED_ICON) != 0 {
+        return Ok(DecodedWindowingOrder::WindowIcon {
+            window_id,
+            cached: flags & FIELD_CACHED_ICON != 0,
+        });
+    }
+
+    let mut order = WindowInfoOrder {
+        window_id,
+        is_new: flags & STATE_NEW != 0,
+        ..WindowInfoOrder::default()
+    };
+    if flags & FIELD_OWNER != 0 {
+        order.owner_window_id = Some(read_u32(src)?);
+    }
+    if flags & FIELD_STYLE != 0 {
+        order.styles = Some(WindowStyles {
+            style: read_u32(src)?,
+            extended_style: read_u32(src)?,
+        });
+    }
+    if flags & FIELD_SHOW != 0 {
+        ensure_size!(in: src, size: 1 /* ShowState */);
+        order.show_state = Some(
+            WindowShowState::from_u8(src.read_u8())
+                .ok_or_else(|| invalid_field_err!("ShowState", "invalid window show state"))?,
+        );
+    }
+    if flags & FIELD_TITLE != 0 {
+        order.title = Some(decode_unicode(src, 520)?);
+    }
+    if flags & FIELD_CLIENT_AREA_OFFSET != 0 {
+        order.client_offset = Some(read_point(src)?);
+    }
+    if flags & FIELD_CLIENT_AREA_SIZE != 0 {
+        order.client_area_size = Some(read_extent(src)?);
+    }
+    if flags & FIELD_RESIZE_MARGIN_X != 0 {
+        order.horizontal_resize_margins = Some(read_margins(src)?);
+    }
+    if flags & FIELD_RESIZE_MARGIN_Y != 0 {
+        order.vertical_resize_margins = Some(read_margins(src)?);
+    }
+    if flags & FIELD_RP_CONTENT != 0 {
+        ensure_size!(in: src, size: 1 /* RPContent */);
+        order.rp_content = Some(src.read_u8() != 0);
+    }
+    if flags & FIELD_ROOT_PARENT != 0 {
+        order.root_parent = Some(read_u32(src)?);
+    }
+    if flags & FIELD_WND_OFFSET != 0 {
+        order.window_offset = Some(read_point(src)?);
+    }
+    if flags & FIELD_WND_CLIENT_DELTA != 0 {
+        order.client_delta = Some(read_point(src)?);
+    }
+    if flags & FIELD_WND_SIZE != 0 {
+        order.window_size = Some(read_extent(src)?);
+    }
+    if flags & FIELD_WND_RECTS != 0 {
+        order.window_rects = Some(read_rectangles(src)?);
+    }
+    if flags & FIELD_VIS_OFFSET != 0 {
+        order.visible_offset = Some(read_point(src)?);
+    }
+    if flags & FIELD_VISIBILITY != 0 {
+        order.visibility_rects = Some(read_rectangles(src)?);
+    }
+    if flags & FIELD_OVERLAY_DESCRIPTION != 0 {
+        order.overlay_description = Some(decode_unicode(src, usize::from(u16::MAX))?);
+    }
+    order.taskbar_button = read_optional_u8(src, flags, FIELD_TASKBAR_BUTTON)?;
+    order.enforce_server_z_order = read_optional_u8(src, flags, FIELD_ENFORCE_SERVER_ZORDER)?;
+    order.app_bar_state = read_optional_u8(src, flags, FIELD_APPBAR_STATE)?;
+    order.app_bar_edge = read_optional_u8(src, flags, FIELD_APPBAR_EDGE)?;
+    Ok(DecodedWindowingOrder::Window(order))
+}
+
+fn decode_desktop_order(flags: u32, src: &mut ReadCursor<'_>) -> DecodeResult<DesktopInfoOrder> {
+    let mut order = DesktopInfoOrder {
+        non_monitored: flags & DESKTOP_NONE != 0,
+        hooked: flags & DESKTOP_HOOKED != 0,
+        arc_began: flags & DESKTOP_ARC_BEGAN != 0,
+        arc_completed: flags & DESKTOP_ARC_COMPLETED != 0,
+        ..DesktopInfoOrder::default()
+    };
+    if flags & DESKTOP_ACTIVE_WINDOW != 0 {
+        order.active_window_id = Some(read_u32(src)?);
+    }
+    if flags & DESKTOP_ZORDER != 0 {
+        ensure_size!(in: src, size: 1 /* NumWindowIds */);
+        let count = usize::from(src.read_u8());
+        ensure_size!(in: src, size: count * 4 /* WindowIds */);
+        order.z_order = Some(core::iter::repeat_with(|| src.read_u32()).take(count).collect());
+    }
+    Ok(order)
+}
+
+fn read_u32(src: &mut ReadCursor<'_>) -> DecodeResult<u32> {
+    ensure_size!(in: src, size: 4);
+    Ok(src.read_u32())
+}
+
+fn read_optional_u8(src: &mut ReadCursor<'_>, flags: u32, flag: u32) -> DecodeResult<Option<u8>> {
+    if flags & flag == 0 {
+        return Ok(None);
+    }
+    ensure_size!(in: src, size: 1);
+    Ok(Some(src.read_u8()))
+}
+
+fn read_point(src: &mut ReadCursor<'_>) -> DecodeResult<WindowPoint> {
+    ensure_size!(in: src, size: 8);
+    Ok(WindowPoint {
+        x: src.read_i32(),
+        y: src.read_i32(),
+    })
+}
+
+fn read_extent(src: &mut ReadCursor<'_>) -> DecodeResult<WindowExtent> {
+    ensure_size!(in: src, size: 8);
+    Ok(WindowExtent {
+        width: src.read_u32(),
+        height: src.read_u32(),
+    })
+}
+
+fn read_margins(src: &mut ReadCursor<'_>) -> DecodeResult<WindowResizeMargins> {
+    ensure_size!(in: src, size: 8);
+    Ok(WindowResizeMargins {
+        start: src.read_u32(),
+        end: src.read_u32(),
+    })
+}
+
+fn read_rectangles(src: &mut ReadCursor<'_>) -> DecodeResult<Vec<WindowRectangle>> {
+    ensure_size!(in: src, size: 2 /* count */);
+    let count = usize::from(src.read_u16());
+    ensure_size!(in: src, size: count * 8 /* TS_RECTANGLE_16 */);
+    Ok(core::iter::repeat_with(|| WindowRectangle {
+        left: src.read_u16(),
+        top: src.read_u16(),
+        right: src.read_u16(),
+        bottom: src.read_u16(),
+    })
+    .take(count)
+    .collect())
+}
+
+fn decode_unicode(src: &mut ReadCursor<'_>, maximum_size: usize) -> DecodeResult<String> {
+    ensure_size!(in: src, size: 2 /* CbString */);
+    let size = usize::from(src.read_u16());
+    if size % 2 != 0 || size > maximum_size {
+        return Err(invalid_field_err!("CbString", "invalid UTF-16 string length"));
+    }
+    ensure_size!(in: src, size: size);
+    let code_units = src
+        .read_slice(size)
+        .chunks_exact(2)
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect::<Vec<_>>();
+    String::from_utf16(&code_units).map_err(|_| invalid_field_err!("String", "invalid UTF-16 string"))
+}
+
+fn encode_unicode(out: &mut Vec<u8>, value: &str) -> EncodeResult<()> {
+    let bytes = value.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>();
+    let size = u16::try_from(bytes.len()).map_err(|_| invalid_field_err!("CbString", "string is too long"))?;
+    out.extend_from_slice(&size.to_le_bytes());
+    out.extend_from_slice(&bytes);
+    Ok(())
+}
+
+fn encode_point(out: &mut Vec<u8>, point: WindowPoint) {
+    out.extend_from_slice(&point.x.to_le_bytes());
+    out.extend_from_slice(&point.y.to_le_bytes());
+}
+
+fn encode_extent(out: &mut Vec<u8>, extent: WindowExtent) {
+    out.extend_from_slice(&extent.width.to_le_bytes());
+    out.extend_from_slice(&extent.height.to_le_bytes());
+}
+
+fn encode_margins(out: &mut Vec<u8>, margins: WindowResizeMargins) {
+    out.extend_from_slice(&margins.start.to_le_bytes());
+    out.extend_from_slice(&margins.end.to_le_bytes());
+}
+
+fn encode_rectangles(out: &mut Vec<u8>, rects: &[WindowRectangle]) -> EncodeResult<()> {
+    let count = u16::try_from(rects.len()).map_err(|_| invalid_field_err!("NumRects", "too many rectangles"))?;
+    out.extend_from_slice(&count.to_le_bytes());
+    for rect in rects {
+        for value in [rect.left, rect.top, rect.right, rect.bottom] {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -479,5 +1056,234 @@ mod tests {
         let orders = try_decode_fast_path_windowing_orders(&mut ReadCursor::new(&update)).unwrap();
         assert_eq!(orders.orders.len(), 1);
         assert!(orders.contains_non_window_orders);
+    }
+
+    /// An xrdp 0.10 new-window order for Wireshark (window 0x1400007 owned by root window 0x221).
+    ///
+    /// Assembled from the field set of xrdp's `rail_create_window`.
+    const XRDP_NEW_WINDOW_ORDER: [u8; 158] = [
+        0x2e, 0x9e, 0x00, 0x1e, 0xdf, 0x05, 0x11, 0x07, 0x00, 0x40, 0x01, 0x21, 0x02, 0x00, 0x00, 0x00, 0x00, 0xcf,
+        0x00, 0x00, 0x00, 0x04, 0x00, 0x05, 0x3c, 0x00, 0x54, 0x00, 0x68, 0x00, 0x65, 0x00, 0x20, 0x00, 0x57, 0x00,
+        0x69, 0x00, 0x72, 0x00, 0x65, 0x00, 0x73, 0x00, 0x68, 0x00, 0x61, 0x00, 0x72, 0x00, 0x6b, 0x00, 0x20, 0x00,
+        0x4e, 0x00, 0x65, 0x00, 0x74, 0x00, 0x77, 0x00, 0x6f, 0x00, 0x72, 0x00, 0x6b, 0x00, 0x20, 0x00, 0x41, 0x00,
+        0x6e, 0x00, 0x61, 0x00, 0x6c, 0x00, 0x79, 0x00, 0x7a, 0x00, 0x65, 0x00, 0x72, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0xee, 0x02, 0x00, 0x00, 0x26, 0x02, 0x00, 0x00, 0x21, 0x02, 0x00, 0x00, 0x14, 0x00,
+        0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xee, 0x02, 0x00, 0x00,
+        0x26, 0x02, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0xee, 0x02, 0x26, 0x02, 0x14, 0x00, 0x00, 0x00,
+        0x14, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0xee, 0x02, 0x26, 0x02,
+    ];
+
+    fn order_bytes(fields_present: u32, fields: &[u8]) -> Vec<u8> {
+        let size = u16::try_from(ALTERNATE_SECONDARY_HEADER_SIZE + ORDER_FLAGS_SIZE + fields.len()).unwrap();
+        let mut order = vec![WINDOWING_ORDER_CONTROL_FLAGS];
+        order.extend_from_slice(&size.to_le_bytes());
+        order.extend_from_slice(&fields_present.to_le_bytes());
+        order.extend_from_slice(fields);
+        order
+    }
+
+    fn le(values: &[u32]) -> Vec<u8> {
+        values.iter().flat_map(|value| value.to_le_bytes()).collect()
+    }
+
+    fn decode_one(order: &[u8]) -> DecodedWindowingOrder {
+        decode_windowing_order(&mut ReadCursor::new(order)).unwrap()
+    }
+
+    fn full_rect(width: u16, height: u16) -> Vec<WindowRectangle> {
+        vec![WindowRectangle {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: height,
+        }]
+    }
+
+    fn desktop_order() -> Vec<u8> {
+        let mut fields = le(&[0x0140_0007]);
+        fields.push(2);
+        fields.extend(le(&[0x0140_0007, 0x0160_0024]));
+        order_bytes(
+            DESKTOP_TYPE | DESKTOP_HOOKED | DESKTOP_ACTIVE_WINDOW | DESKTOP_ZORDER,
+            &fields,
+        )
+    }
+
+    #[test]
+    fn decodes_xrdp_new_window_order() {
+        let DecodedWindowingOrder::Window(window) = decode_one(&XRDP_NEW_WINDOW_ORDER) else {
+            panic!("expected a window order");
+        };
+
+        assert_eq!(
+            window,
+            WindowInfoOrder {
+                window_id: 0x0140_0007,
+                is_new: true,
+                owner_window_id: Some(0x221),
+                styles: Some(WindowStyles {
+                    style: 0x00CF_0000,
+                    extended_style: 0x0004_0000,
+                }),
+                show_state: Some(WindowShowState::Shown),
+                title: Some("The Wireshark Network Analyzer".to_owned()),
+                client_offset: Some(WindowPoint::default()),
+                client_area_size: Some(WindowExtent {
+                    width: 750,
+                    height: 550
+                }),
+                root_parent: Some(0x221),
+                window_offset: Some(WindowPoint { x: 20, y: 20 }),
+                client_delta: Some(WindowPoint::default()),
+                window_size: Some(WindowExtent {
+                    width: 750,
+                    height: 550
+                }),
+                window_rects: Some(full_rect(750, 550)),
+                visible_offset: Some(WindowPoint { x: 20, y: 20 }),
+                visibility_rects: Some(full_rect(750, 550)),
+                ..WindowInfoOrder::default()
+            }
+        );
+        let update = [[1, 0].as_slice(), &XRDP_NEW_WINDOW_ORDER].concat();
+        let validated = try_decode_fast_path_windowing_orders(&mut ReadCursor::new(&update)).unwrap();
+        assert!(validated.orders[0].requires_extended_support());
+        assert_eq!(
+            validated.orders[0].decode_typed().unwrap(),
+            decode_one(&XRDP_NEW_WINDOW_ORDER)
+        );
+    }
+
+    #[test]
+    fn decodes_xrdp_configure_window_order() {
+        let minus_eight = u32::from_le_bytes((-8i32).to_le_bytes());
+        let mut fields = le(&[0x0140_0007, 0, 0, 640, 480, 0x221, minus_eight, 30, 0, 0, 640, 480]);
+        fields.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0x80, 0x02, 0xe0, 0x01]);
+        fields.extend(le(&[minus_eight, 30]));
+        fields.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0x80, 0x02, 0xe0, 0x01]);
+        let flags = WINDOW_TYPE
+            | FIELD_CLIENT_AREA_OFFSET
+            | FIELD_CLIENT_AREA_SIZE
+            | FIELD_ROOT_PARENT
+            | FIELD_WND_OFFSET
+            | FIELD_WND_CLIENT_DELTA
+            | FIELD_WND_SIZE
+            | FIELD_WND_RECTS
+            | FIELD_VIS_OFFSET
+            | FIELD_VISIBILITY;
+        let order = order_bytes(flags, &fields);
+
+        let DecodedWindowingOrder::Window(window) = decode_one(&order) else {
+            panic!("expected a window order");
+        };
+        assert!(!window.is_new);
+        assert_eq!(window.title, None);
+        assert_eq!(window.styles, None);
+        assert_eq!(window.show_state, None);
+        assert_eq!(window.window_offset, Some(WindowPoint { x: -8, y: 30 }));
+        assert_eq!(
+            window.window_size,
+            Some(WindowExtent {
+                width: 640,
+                height: 480
+            })
+        );
+        assert_eq!(window.visibility_rects, Some(full_rect(640, 480)));
+    }
+
+    #[test]
+    fn decodes_show_and_deleted_orders() {
+        let show = order_bytes(WINDOW_TYPE | FIELD_SHOW, &[7, 0, 0, 0, 2]);
+        assert_eq!(
+            decode_one(&show),
+            DecodedWindowingOrder::Window(WindowInfoOrder {
+                window_id: 7,
+                show_state: Some(WindowShowState::Minimized),
+                ..WindowInfoOrder::default()
+            })
+        );
+        assert_eq!(
+            decode_one(&order_bytes(WINDOW_TYPE | STATE_DELETED, &le(&[7]))),
+            DecodedWindowingOrder::WindowDeleted { window_id: 7 }
+        );
+        let invalid_show = order_bytes(WINDOW_TYPE | FIELD_SHOW, &[7, 0, 0, 0, 4]);
+        assert!(decode_windowing_order(&mut ReadCursor::new(&invalid_show)).is_err());
+    }
+
+    #[test]
+    fn typed_decoder_agrees_with_validator_on_truncation() {
+        for order in [XRDP_NEW_WINDOW_ORDER.to_vec(), desktop_order()] {
+            for length in 0..order.len() {
+                let mut truncated = order[..length].to_vec();
+                if length >= ALTERNATE_SECONDARY_HEADER_SIZE {
+                    truncated[1..3].copy_from_slice(&u16::try_from(length).unwrap().to_le_bytes());
+                }
+                let validated = WindowingOrder::decode(&mut ReadCursor::new(&truncated)).is_ok();
+                let typed = decode_windowing_order(&mut ReadCursor::new(&truncated)).is_ok();
+                assert_eq!(validated, typed, "length {length}");
+                assert!(!typed, "a {length}-byte prefix must not decode");
+            }
+            assert!(decode_windowing_order(&mut ReadCursor::new(&order)).is_ok());
+        }
+    }
+
+    #[test]
+    fn decodes_desktop_active_window_and_zorder() {
+        assert_eq!(
+            decode_one(&desktop_order()),
+            DecodedWindowingOrder::Desktop(DesktopInfoOrder {
+                hooked: true,
+                active_window_id: Some(0x0140_0007),
+                z_order: Some(vec![0x0140_0007, 0x0160_0024]),
+                ..DesktopInfoOrder::default()
+            })
+        );
+        assert_eq!(
+            decode_one(&order_bytes(DESKTOP_TYPE | DESKTOP_NONE, &[])),
+            DecodedWindowingOrder::Desktop(DesktopInfoOrder {
+                non_monitored: true,
+                ..DesktopInfoOrder::default()
+            })
+        );
+    }
+
+    #[test]
+    fn forwarded_payload_round_trip() {
+        let DecodedWindowingOrder::Window(mut window) = decode_one(&XRDP_NEW_WINDOW_ORDER) else {
+            panic!("expected a window order");
+        };
+        window.overlay_description = Some("\u{e9}t\u{e9}".to_owned());
+        window.horizontal_resize_margins = Some(WindowResizeMargins { start: 4, end: 5 });
+        window.vertical_resize_margins = Some(WindowResizeMargins { start: 6, end: 7 });
+        window.rp_content = Some(true);
+        window.taskbar_button = Some(1);
+        window.enforce_server_z_order = Some(1);
+        window.app_bar_state = Some(2);
+        window.app_bar_edge = Some(3);
+        let orders = vec![
+            DecodedWindowingOrder::Window(window),
+            DecodedWindowingOrder::WindowDeleted { window_id: 0x0160_0024 },
+            DecodedWindowingOrder::Desktop(DesktopInfoOrder {
+                active_window_id: Some(0x0140_0007),
+                hooked: true,
+                ..DesktopInfoOrder::default()
+            }),
+        ];
+
+        let forwarded = encode_forwarded_windowing_orders(&orders).unwrap();
+        assert_eq!(forwarded[..8], [0, 0, 0, 0, 3, 0, 0, 0]);
+        assert_eq!(decode_forwarded_windowing_orders(&forwarded).unwrap(), orders);
+
+        let mut xrdp = vec![0, 0, 0, 0, 1, 0, 0, 0];
+        xrdp.extend_from_slice(&XRDP_NEW_WINDOW_ORDER);
+        let decoded = decode_forwarded_windowing_orders(&xrdp).unwrap();
+        assert_eq!(encode_forwarded_windowing_orders(&decoded).unwrap(), xrdp);
+
+        assert!(decode_forwarded_windowing_orders(&[1, 0, 0, 0, 0, 0, 0, 0]).is_err());
+        let icon = DecodedWindowingOrder::WindowIcon {
+            window_id: 1,
+            cached: true,
+        };
+        assert!(encode_forwarded_windowing_orders(&[icon]).is_err());
     }
 }
