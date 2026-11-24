@@ -1,3 +1,5 @@
+mod windows;
+
 use std::collections::VecDeque;
 
 use ironrdp_core::{AsAny, decode};
@@ -12,6 +14,8 @@ use crate::pdu::{
     PowerDisplayRequestPdu, RailPdu, ServerSystemParametersPdu, SystemCommandPdu, SystemMenuPdu,
     SystemParameterRectangle, WindowMovePdu, ZOrderSyncPdu, decode_server_pdu_lenient,
 };
+
+pub use self::windows::{RailRect, RailWindow, RailWindowChanges, RailWindowEvent, RailWindowRole, RailWindowTracker};
 
 /// Client-originated RAIL events exposed through this host-neutral boundary.
 ///
