@@ -117,6 +117,38 @@ export class PublicAPI {
         return this.remoteDesktopService.enableFileTransfer(provider);
     }
 
+    private sendPointerMove(x: number, y: number) {
+        this.remoteDesktopService.sendPointerMove(x, y);
+    }
+
+    private sendPointerButton(button: number, pressed: boolean) {
+        this.remoteDesktopService.sendPointerButton(button, pressed);
+    }
+
+    private sendWheel(event: WheelEvent) {
+        this.remoteDesktopService.sendWheel(event);
+    }
+
+    private sendKeyboardEvent(event: KeyboardEvent) {
+        this.remoteDesktopService.sendKeyboardEvent(event);
+    }
+
+    private syncInputState(event: MouseEvent | KeyboardEvent) {
+        this.remoteDesktopService.syncInputState(event);
+    }
+
+    private releaseAllInputs() {
+        this.remoteDesktopService.releaseAllInputs();
+    }
+
+    private setOnCursorStyleCallback(callback: (cursor: string) => void) {
+        this.remoteDesktopService.setOnCursorStyle(callback);
+    }
+
+    private renderCanvas(): HTMLCanvasElement | undefined {
+        return this.remoteDesktopService.renderCanvas();
+    }
+
     getExposedFunctions(): UserInteraction {
         return {
             setVisibility: this.setVisibility.bind(this),
@@ -140,6 +172,14 @@ export class PublicAPI {
             pasteClipboardText: this.pasteClipboardText.bind(this),
             invokeExtension: this.invokeExtension.bind(this),
             enableFileTransfer: this.enableFileTransfer.bind(this),
+            sendPointerMove: this.sendPointerMove.bind(this),
+            sendPointerButton: this.sendPointerButton.bind(this),
+            sendWheel: this.sendWheel.bind(this),
+            sendKeyboardEvent: this.sendKeyboardEvent.bind(this),
+            syncInputState: this.syncInputState.bind(this),
+            releaseAllInputs: this.releaseAllInputs.bind(this),
+            onCursorStyleCallback: this.setOnCursorStyleCallback.bind(this),
+            renderCanvas: this.renderCanvas.bind(this),
         };
     }
 }

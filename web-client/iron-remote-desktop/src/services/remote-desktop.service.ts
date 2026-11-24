@@ -26,6 +26,7 @@ type OnForceClipboardUpdate = () => void;
 type OnCanvasResized = () => void;
 type OnWarning = (data: string) => void;
 type OnClipboardRemoteUpdate = () => void;
+type OnCursorStyle = (cursor: string) => void;
 
 export class RemoteDesktopService {
     private module: RemoteDesktopModule;
@@ -36,6 +37,7 @@ export class RemoteDesktopService {
     private onCanvasResized?: OnCanvasResized;
     private onWarningCallback?: OnWarning;
     private onClipboardRemoteUpdate?: OnClipboardRemoteUpdate;
+    private onCursorStyle?: OnCursorStyle;
     private fileTransferProvider?: FileTransferProvider;
     private cursorHasOverride: boolean = false;
     private lastCursorStyle: string = 'default';
@@ -224,6 +226,66 @@ export class RemoteDesktopService {
     updateMousePosition(position: MousePosition) {
         this.doTransactionFromDeviceEvents([this.module.DeviceEvent.mouseMove(position.x, position.y)]);
         this.mousePositionObservable.publish(position);
+    }
+
+    // External input: surfaces other than this component's canvas (e.g. RemoteApp windows drawn by the
+    // host page) drive the session through the same pipeline. Coordinates are desktop pixels.
+
+    /// Moves the remote pointer, rounded and clamped to the desktop.
+    sendPointerMove(x: number, y: number) {
+        if (!this.session) return;
+        const { width, height } = this.desktopBounds();
+        this.updateMousePosition({
+            x: RemoteDesktopService.clamp(Math.round(x), 0, width - 1),
+            y: RemoteDesktopService.clamp(Math.round(y), 0, height - 1),
+        });
+    }
+
+    /// Presses or releases a pointer button (DOM numbering: 0 left, 1 middle, 2 right).
+    sendPointerButton(button: number, pressed: boolean) {
+        if (!this.session) return;
+        const device = this.module.DeviceEvent;
+        this.doTransactionFromDeviceEvents([
+            pressed ? device.mouseButtonPressed(button) : device.mouseButtonReleased(button),
+        ]);
+    }
+
+    /// Forwards a wheel event with the same notch quantization as the canvas.
+    sendWheel(event: WheelEvent) {
+        if (!this.session) return;
+        this.mouseWheel(event);
+    }
+
+    /// Reconciles lock keys and held pointer buttons with the browser state, e.g. when the pointer
+    /// enters an external surface.
+    syncInputState(event: MouseEvent | KeyboardEvent) {
+        if (event instanceof MouseEvent) {
+            this.mouseIn(event);
+        } else {
+            this.syncModifier(event);
+        }
+    }
+
+    /// Callback which is called with the CSS cursor of the remote pointer, now and on every change.
+    setOnCursorStyle(callback: OnCursorStyle) {
+        this.onCursorStyle = callback;
+        callback(this.lastCursorStyle);
+    }
+
+    /// The canvas holding the whole remote desktop image.
+    renderCanvas(): HTMLCanvasElement | undefined {
+        return this.canvas;
+    }
+
+    private desktopBounds(): { width: number; height: number } {
+        if (this.canvas != null && this.canvas.width > 0 && this.canvas.height > 0) {
+            return { width: this.canvas.width, height: this.canvas.height };
+        }
+        return this.session?.desktopSize() ?? { width: 1, height: 1 };
+    }
+
+    private static clamp(value: number, min: number, max: number): number {
+        return Math.min(Math.max(value, min), Math.max(min, max));
     }
 
     configBuilder(): ConfigBuilder {
@@ -453,7 +515,7 @@ export class RemoteDesktopService {
         return this.session?.invokeExtension(ext);
     }
 
-    private releaseAllInputs() {
+    releaseAllInputs() {
         // Blur/alt-tab/mouse-out: release everything so no key is stranded down. The client half
         // releases every keysym it holds (firing keyup -> the server half releases the matching
         // scancodes and, once nothing is user-held, resets any Shift/AltGr it pressed on the guest's
@@ -551,6 +613,7 @@ export class RemoteDesktopService {
         }
 
         this.lastCursorStyle = cssStyle;
+        this.onCursorStyle?.(cssStyle);
 
         if (!this.cursorHasOverride) {
             this.canvas!.style.cursor = cssStyle;
