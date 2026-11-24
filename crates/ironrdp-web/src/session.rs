@@ -66,7 +66,7 @@ use crate::input::InputTransaction;
 use crate::network_client::WasmNetworkClient;
 use crate::printer::{JsPrinterStreamCallbacks, WasmPrinter, WasmPrinterBackend, wasm_printer_pair};
 use crate::rail::js::JsRailSink;
-use crate::rail::{DamageBatch, RailOp, RailShared, RemoteAppConfig, WebRail};
+use crate::rail::{DamageBatch, RailOp, RailShared, RemoteAppConfig, WebRail, admit_op};
 
 const DEFAULT_WIDTH: u16 = 1280;
 const DEFAULT_HEIGHT: u16 = 720;
@@ -704,6 +704,14 @@ impl Session {
             return Err(remote_app_off());
         }
         let op = op.map_err(|error| IronError::from(anyhow::Error::msg(error)))?;
+        let admitted = self
+            .rail_shared
+            .as_ref()
+            .map_or(Ok(true), |shared| admit_op(&mut shared.borrow_mut(), &op))
+            .map_err(|error| IronError::from(anyhow::Error::msg(error)))?;
+        if !admitted {
+            return Ok(JsValue::NULL);
+        }
         self.input_events_tx
             .unbounded_send(RdpInputEvent::Rail(op))
             .context("send RAIL operation")?;
@@ -1456,7 +1464,12 @@ impl iron_remote_desktop::Session for Session {
             };
             |rail_set_work_area: JsValue| {
                 let obj = into_object(rail_set_work_area)?;
-                let op = RailOp::set_work_area(get_u32(&obj, "width")?, get_u32(&obj, "height")?);
+                let op = RailOp::set_work_area(
+                    get_u32(&obj, "left")?,
+                    get_u32(&obj, "top")?,
+                    get_u32(&obj, "width")?,
+                    get_u32(&obj, "height")?,
+                );
                 return self.send_rail_op(op);
             };
             |rail_resync: JsValue| {

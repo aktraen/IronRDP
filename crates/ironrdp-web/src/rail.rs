@@ -15,7 +15,8 @@ use ironrdp_rail::client::{
     RailWindowEvent, RailWindowRole, RailWindowTracker,
 };
 use ironrdp_rail::pdu::{
-    ActivatePdu, ClientStatusPdu, ExecutePdu, RailPdu, Rectangle, SystemCommand, SystemCommandPdu, WindowMovePdu,
+    ActivatePdu, ClientStatusPdu, ExecutePdu, RailPdu, Rectangle, SystemCommand, SystemCommandPdu,
+    SystemParameterRectangle, WindowMovePdu,
 };
 use ironrdp_svc::SvcMessage;
 use tracing::{debug, warn};
@@ -26,6 +27,8 @@ const DEFAULT_BOOTSTRAP_EXECUTABLE: &str = "/usr/bin/true";
 const DEFAULT_MAX_INIT_ATTEMPTS: u32 = 24;
 /// Above this many damaged rectangles in one loop, a single bounding box is reported instead.
 const MAX_DAMAGE_RECTS: usize = 64;
+/// Operations (other than window moves, work areas and resyncs) accepted before RAIL is established.
+const MAX_QUEUED_OPS: usize = 64;
 /// Ticks (5 s each) to wait for re-announced windows before pruning the others.
 const RESYNC_TICKS: u8 = 2;
 
@@ -76,9 +79,11 @@ pub(crate) enum RailPhase {
     Established,
     /// The server restarted its RAIL state; windows it does not re-announce are pruned.
     Resyncing,
-    /// No Handshake after the configured number of attempts.
+    /// No Handshake after the configured number of attempts. This is also what a server with its RAIL
+    /// channel disabled produces (after 24 x 5 s by default), since it never answers.
     Exhausted,
-    /// The RAIL channel cannot be used (the server did not join it); nothing is sent any more.
+    /// The RAIL channel cannot be used (the server did not join it); nothing is sent any more and a
+    /// late Handshake does not bring it back.
     Unavailable,
 }
 
@@ -99,9 +104,11 @@ impl RailPhase {
 pub(crate) struct RailStateSnapshot {
     pub(crate) phase: RailPhase,
     pub(crate) attempt: u32,
-    /// The desktop size, which is also the work area sent to the server (the whole desktop).
+    /// The size of the remote desktop.
     pub(crate) desktop_width: u16,
     pub(crate) desktop_height: u16,
+    /// The work area sent to the server: the whole desktop unless the host set another one.
+    pub(crate) work_area: RailRect,
     pub(crate) warning: Option<String>,
 }
 
@@ -112,7 +119,7 @@ pub(crate) enum RailOp {
     Activate { window_id: u32, enabled: bool },
     SysCommand { window_id: u32, command: SystemCommand },
     WindowMove(WindowMovePdu),
-    SetWorkArea { width: u16, height: u16 },
+    SetWorkArea(SystemParameterRectangle),
     Resync,
 }
 
@@ -162,12 +169,55 @@ impl RailOp {
         Ok(Self::WindowMove(WindowMovePdu { window_id, rectangle }))
     }
 
-    pub(crate) fn set_work_area(width: u32, height: u32) -> Result<Self, String> {
-        match (u16::try_from(width), u16::try_from(height)) {
-            (Ok(width), Ok(height)) if width > 0 && height > 0 => Ok(Self::SetWorkArea { width, height }),
-            _ => Err(format!("invalid RAIL work area {width}x{height}")),
+    /// A work area at `left, top` with the given size (at least 1x1, inside 16-bit coordinates).
+    pub(crate) fn set_work_area(left: u32, top: u32, width: u32, height: u32) -> Result<Self, String> {
+        let edge = |start: u32, length: u32| {
+            u16::try_from(u64::from(start) + u64::from(length))
+                .ok()
+                .filter(|_| length > 0)
+                .zip(u16::try_from(start).ok())
+        };
+        match (edge(left, width), edge(top, height)) {
+            (Some((right, left)), Some((bottom, top))) => Ok(Self::SetWorkArea(SystemParameterRectangle {
+                left,
+                top,
+                right,
+                bottom,
+            })),
+            _ => Err(format!("invalid RAIL work area {width}x{height} at {left},{top}")),
         }
     }
+
+    /// Whether the operation is held in the RAIL queue until the channel is established.
+    const fn is_queued(&self) -> bool {
+        matches!(self, Self::Execute(_) | Self::Activate { .. } | Self::SysCommand { .. })
+    }
+}
+
+/// Decides synchronously, from the published state, whether an operation is sent to the session loop.
+///
+/// Returns `Ok(false)` for a window move of a window that is not tracked (ignored), and an error while
+/// RAIL is exhausted or unavailable, or when the queue of operations waiting for the channel is full.
+pub(crate) fn admit_op(shared: &mut RailShared, op: &RailOp) -> Result<bool, String> {
+    let phase = shared.state.as_ref().map_or(RailPhase::Initiating, |state| state.phase);
+    match phase {
+        RailPhase::Exhausted | RailPhase::Unavailable => {
+            return Err(format!("RemoteApp is {}: the operation was not sent", phase.as_str()));
+        }
+        RailPhase::Initiating if op.is_queued() => {
+            if shared.queued_ops >= MAX_QUEUED_OPS {
+                return Err(format!(
+                    "RemoteApp is not established yet and {MAX_QUEUED_OPS} operations are already waiting"
+                ));
+            }
+            shared.queued_ops += 1;
+        }
+        RailPhase::Initiating | RailPhase::Established | RailPhase::Resyncing => {}
+    }
+    if let RailOp::WindowMove(window_move) = op {
+        return Ok(shared.windows.iter().any(|window| window.id == window_move.window_id));
+    }
+    Ok(true)
 }
 
 /// A damaged area of the desktop image; `right` and `bottom` are exclusive.
@@ -238,6 +288,8 @@ pub(crate) trait RailSink {
 pub(crate) struct RailShared {
     pub(crate) state: Option<RailStateSnapshot>,
     pub(crate) windows: Vec<RailWindow>,
+    /// Operations admitted while initiating, reset once established.
+    pub(crate) queued_ops: usize,
 }
 
 /// Drives the RAIL channel of a RemoteApp session from the session loop.
@@ -250,6 +302,7 @@ pub(crate) struct WebRail<S> {
     attempt: u32,
     desktop_width: u16,
     desktop_height: u16,
+    work_area: Option<RailRect>,
     resync_ticks: Option<u8>,
 }
 
@@ -270,6 +323,7 @@ impl<S: RailSink> WebRail<S> {
             attempt: 0,
             desktop_width,
             desktop_height,
+            work_area: None,
             resync_ticks: None,
         }
     }
@@ -318,6 +372,7 @@ impl<S: RailSink> WebRail<S> {
             match event {
                 RailEvent::Handshake { handshake_ex_flags, .. } => {
                     debug!(?handshake_ex_flags, attempt = self.attempt, "RAIL established");
+                    self.shared.borrow_mut().queued_ops = 0;
                     self.set_phase(RailPhase::Established);
                 }
                 RailEvent::ServerReinitialized { .. } => self.begin_resync(),
@@ -352,7 +407,7 @@ impl<S: RailSink> WebRail<S> {
     }
 
     pub(crate) fn on_op(&mut self, client: &mut RailClient, op: RailOp) -> PduResult<RailSvcMessages> {
-        if self.phase == RailPhase::Unavailable {
+        if matches!(self.phase, RailPhase::Unavailable | RailPhase::Exhausted) {
             return Ok(Vec::new().into());
         }
         match op {
@@ -378,7 +433,16 @@ impl<S: RailSink> WebRail<S> {
                 }
                 Ok(messages)
             }
-            RailOp::SetWorkArea { width, height } => Ok(self.on_desktop_resized(client, width, height)),
+            RailOp::SetWorkArea(area) => {
+                self.work_area = Some(RailRect {
+                    left: i32::from(area.left),
+                    top: i32::from(area.top),
+                    width: u32::from(area.right.saturating_sub(area.left)),
+                    height: u32::from(area.bottom.saturating_sub(area.top)),
+                });
+                self.publish_state(None);
+                Ok(client.set_work_area(area))
+            }
             RailOp::Resync => {
                 if !client.is_established() {
                     return Ok(Vec::new().into());
@@ -390,9 +454,11 @@ impl<S: RailSink> WebRail<S> {
     }
 
     /// Sends the new work area after the desktop size changed; the server re-announces its windows.
+    /// The work area becomes the whole new desktop again.
     pub(crate) fn on_desktop_resized(&mut self, client: &mut RailClient, width: u16, height: u16) -> RailSvcMessages {
         self.desktop_width = width;
         self.desktop_height = height;
+        self.work_area = None;
         self.publish_state(None);
         client.update_desktop_size(width, height)
     }
@@ -426,6 +492,9 @@ impl<S: RailSink> WebRail<S> {
     }
 
     fn set_phase(&mut self, phase: RailPhase) {
+        if self.phase == RailPhase::Unavailable {
+            return;
+        }
         self.phase = phase;
         self.publish_state(None);
     }
@@ -436,6 +505,12 @@ impl<S: RailSink> WebRail<S> {
             attempt: self.attempt,
             desktop_width: self.desktop_width,
             desktop_height: self.desktop_height,
+            work_area: self.work_area.unwrap_or_else(|| RailRect {
+                left: 0,
+                top: 0,
+                width: u32::from(self.desktop_width),
+                height: u32::from(self.desktop_height),
+            }),
             warning,
         };
         self.sink.state(&state);
@@ -581,6 +656,7 @@ pub(crate) mod js {
         set(&object, "attempt", &number(state.attempt));
         set(&object, "desktopWidth", &number(state.desktop_width));
         set(&object, "desktopHeight", &number(state.desktop_height));
+        set(&object, "workArea", &rect(&state.work_area));
         if let Some(warning) = &state.warning {
             set(&object, "warning", &JsValue::from_str(warning));
         }
@@ -653,12 +729,12 @@ mod tests {
         WindowStyles, encode_forwarded_windowing_orders,
     };
     use ironrdp_rail::client::{RailClient, RailWindowEvent};
-    use ironrdp_rail::pdu::{RailPdu, SystemCommand};
+    use ironrdp_rail::pdu::{ClientSystemParameter, ClientSystemParametersPdu, RailPdu, SystemCommand};
     use ironrdp_svc::{SvcMessage, SvcProcessor as _};
 
     use super::{
-        DamageBatch, GraphicsRegion, RailOp, RailPhase, RailShared, RailSink, RailStateSnapshot, RemoteAppConfig,
-        WebRail,
+        DamageBatch, GraphicsRegion, MAX_QUEUED_OPS, RailOp, RailPhase, RailRect, RailShared, RailSink,
+        RailStateSnapshot, RemoteAppConfig, WebRail, admit_op,
     };
 
     const XRDP_HANDSHAKE: [u8; 8] = [0x05, 0x00, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00];
@@ -825,9 +901,10 @@ mod tests {
         assert!(RailOp::window_move(7, -20, 30, 800, 600).is_ok());
         assert!(RailOp::window_move(7, 32_000, 0, 800, 600).is_err());
         assert!(RailOp::window_move(7, i32::MIN, 0, 1, 1).is_err());
-        assert!(RailOp::set_work_area(1280, 720).is_ok());
-        assert!(RailOp::set_work_area(0, 720).is_err());
-        assert!(RailOp::set_work_area(70_000, 720).is_err());
+        assert!(RailOp::set_work_area(0, 0, 1280, 720).is_ok());
+        assert!(RailOp::set_work_area(0, 0, 0, 720).is_err());
+        assert!(RailOp::set_work_area(0, 0, 70_000, 720).is_err());
+        assert!(RailOp::set_work_area(65_000, 0, 1000, 720).is_err());
     }
 
     #[test]
@@ -968,11 +1045,99 @@ mod tests {
             2
         );
         assert_eq!(harness.rail.phase(), RailPhase::Resyncing);
-        let work_area = RailOp::set_work_area(1280, 720).unwrap();
+        let work_area = RailOp::set_work_area(0, 40, 1600, 820).unwrap();
+        assert!(matches!(
+            sent(harness.rail.on_op(&mut harness.client, work_area).unwrap()).as_slice(),
+            [RailPdu::ClientSystemParameters(ClientSystemParametersPdu {
+                parameter: ClientSystemParameter::WorkArea(_)
+            })]
+        ));
+        let shared = harness.shared.borrow();
+        let state = shared.state.as_ref().unwrap();
+        assert_eq!((state.desktop_width, state.desktop_height), (1600, 900));
         assert_eq!(
-            sent(harness.rail.on_op(&mut harness.client, work_area).unwrap()).len(),
+            state.work_area,
+            RailRect {
+                left: 0,
+                top: 40,
+                width: 1600,
+                height: 820
+            }
+        );
+    }
+
+    #[test]
+    fn a_desktop_resize_resets_the_work_area() {
+        let mut harness = established();
+        let work_area = RailOp::set_work_area(0, 40, 1600, 820).unwrap();
+        harness.rail.on_op(&mut harness.client, work_area).unwrap();
+
+        assert_eq!(
+            sent(harness.rail.on_desktop_resized(&mut harness.client, 1280, 720)).len(),
             2
         );
-        assert_eq!(harness.shared.borrow().state.as_ref().unwrap().desktop_width, 1280);
+
+        let shared = harness.shared.borrow();
+        let state = shared.state.as_ref().unwrap();
+        assert_eq!(
+            (state.desktop_width, state.work_area.width, state.work_area.top),
+            (1280, 1280, 0)
+        );
+    }
+
+    #[test]
+    fn ops_are_refused_while_exhausted_or_unavailable() {
+        let mut shared = RailShared::default();
+        let execute = RailOp::execute("/usr/bin/xterm".to_owned(), String::new(), String::new()).unwrap();
+        for phase in [RailPhase::Exhausted, RailPhase::Unavailable] {
+            shared.state = Some(RailStateSnapshot {
+                phase,
+                attempt: 24,
+                desktop_width: 1600,
+                desktop_height: 900,
+                work_area: RailRect::default(),
+                warning: None,
+            });
+            let error = admit_op(&mut shared, &execute).unwrap_err();
+            assert!(error.contains(phase.as_str()), "{error}");
+            assert!(admit_op(&mut shared, &RailOp::Resync).is_err());
+        }
+        assert_eq!(shared.queued_ops, 0);
+    }
+
+    #[test]
+    fn ops_queue_while_initiating_up_to_a_limit() {
+        let mut shared = RailShared::default();
+        let execute = RailOp::execute("/usr/bin/xterm".to_owned(), String::new(), String::new()).unwrap();
+        for _ in 0..MAX_QUEUED_OPS {
+            assert_eq!(admit_op(&mut shared, &execute), Ok(true));
+        }
+        assert!(admit_op(&mut shared, &execute).unwrap_err().contains("waiting"));
+        assert_eq!(admit_op(&mut shared, &RailOp::Resync), Ok(true));
+        let unknown_move = RailOp::window_move(7, 0, 0, 10, 10).unwrap();
+        assert_eq!(admit_op(&mut shared, &unknown_move), Ok(false));
+
+        let mut harness = harness(24);
+        harness.rail.start(&mut harness.client).unwrap();
+        harness.shared.borrow_mut().queued_ops = MAX_QUEUED_OPS;
+        harness.client.process(&XRDP_HANDSHAKE).unwrap();
+        harness.rail.drain_channel_events(&mut harness.client);
+        assert_eq!(harness.shared.borrow().queued_ops, 0);
+    }
+
+    #[test]
+    fn unavailable_survives_a_late_handshake() {
+        let mut harness = harness(24);
+        harness.rail.start(&mut harness.client).unwrap();
+        harness.rail.mark_unavailable("no channel".to_owned());
+
+        harness.client.process(&XRDP_HANDSHAKE).unwrap();
+        harness.rail.drain_channel_events(&mut harness.client);
+
+        assert_eq!(harness.rail.phase(), RailPhase::Unavailable);
+        assert_eq!(
+            harness.shared.borrow().state.as_ref().unwrap().phase,
+            RailPhase::Unavailable
+        );
     }
 }
