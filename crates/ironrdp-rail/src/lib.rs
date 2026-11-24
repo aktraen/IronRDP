@@ -15,3 +15,6 @@ pub mod pdu;
 
 #[cfg(feature = "alloc")]
 pub use pdu::*;
+
+#[cfg(feature = "std")]
+pub mod client;

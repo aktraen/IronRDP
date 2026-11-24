@@ -3088,6 +3088,7 @@ name = "ironrdp-rail"
 version = "0.1.0"
 dependencies = [
  "ironrdp-core 0.2.1",
+ "ironrdp-pdu",
  "ironrdp-svc",
 ]
 

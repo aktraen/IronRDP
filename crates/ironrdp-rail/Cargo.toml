@@ -14,11 +14,12 @@ categories.workspace = true
 
 [features]
 default = ["std"]
-std = ["alloc", "ironrdp-core/std", "dep:ironrdp-svc"]
+std = ["alloc", "ironrdp-core/std", "dep:ironrdp-svc", "dep:ironrdp-pdu"]
 alloc = ["dep:ironrdp-core", "ironrdp-core/alloc"]
 
 [dependencies]
 ironrdp-core = { path = "../ironrdp-core", version = "0.2", default-features = false, optional = true } # public
+ironrdp-pdu = { path = "../ironrdp-pdu", version = "0.9", optional = true, features = ["std"] } # public
 ironrdp-svc = { path = "../ironrdp-svc", version = "0.8", optional = true } # public
 
 [lints]
