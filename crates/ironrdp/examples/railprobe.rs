@@ -38,7 +38,7 @@ use ironrdp_core::ReadCursor;
 use ironrdp_pdu::rdp::client_info::{CompressionType, PerformanceFlags, TimezoneInfo};
 use ironrdp_pdu::window::{decode_forwarded_windowing_orders, try_decode_slow_path_windowing_orders};
 use ironrdp_rail::client::{
-    RailClient, RailEvent, RailInputEvent, RailServerCompat, RailSvcMessages, RailWindow, RailWindowEvent,
+    RailClient, RailEvent, RailInputEvent, RailRect, RailServerCompat, RailSvcMessages, RailWindow, RailWindowEvent,
     RailWindowTracker,
 };
 use ironrdp_rail::pdu::{
@@ -263,6 +263,12 @@ fn run_step(
     image: &DecodedImage,
     options: &Options,
 ) -> anyhow::Result<Option<Instant>> {
+    // A resync waits one step (3 s): windows the server did not send any order for are then pruned.
+    if !matches!(step, Step::Wait(_)) {
+        for event in tracker.end_resync() {
+            println!("resync pruned {event:?}");
+        }
+    }
     match step {
         Step::Wait(duration) => return Ok(Some(Instant::now() + *duration)),
         Step::Exec(path) => {
@@ -283,6 +289,16 @@ fn run_step(
                 rectangle,
             });
             send_rail(active_stage, framed, |rail| rail.queue_input(input))?;
+            // xrdp never reports geometry back, so the tracker records the move itself.
+            let moved = RailRect {
+                left: rect[0],
+                top: rect[1],
+                width: u32::try_from(rect[2]).context("move width")?,
+                height: u32::try_from(rect[3]).context("move height")?,
+            };
+            if let Some(event) = tracker.apply_local_move(id, moved) {
+                println!("{event:?}");
+            }
         }
         Step::Activate(window) => {
             let input = RailInputEvent::Activate(ActivatePdu {
@@ -304,9 +320,6 @@ fn run_step(
             return Ok(Some(Instant::now() + Duration::from_secs(3)));
         }
         Step::Shot(tag) => {
-            for event in tracker.end_resync() {
-                println!("resync pruned {event:?}");
-            }
             if let Some(dir) = &options.out {
                 save_shots(image, tracker, dir, tag)?;
             }
