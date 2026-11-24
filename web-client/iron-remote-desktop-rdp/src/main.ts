@@ -69,6 +69,37 @@ export function legacyGraphics(enable: boolean): Extension {
     return new Extension('legacy_graphics', enable);
 }
 
+// --- RemoteApp (RAIL) ---
+
+export {
+    remoteApp,
+    railWindowCallback,
+    railStateCallback,
+    graphicsRegionCallback,
+    railExecute,
+    railActivate,
+    railSysCommand,
+    railWindowMove,
+    railSetWorkArea,
+    railResync,
+    railState,
+} from './rail';
+export type {
+    RemoteAppOptions,
+    RailWindowRole,
+    RailShowState,
+    RailRect,
+    RailWindowSnapshot,
+    RailWindowChange,
+    RailWindowEvent,
+    RailState,
+    RailStateEvent,
+    RailSessionState,
+    GraphicsRegion,
+    RailSysCommand,
+    RailExecuteOptions,
+} from './rail';
+
 // --- File transfer (RDP-specific) ---
 
 export { RdpFileTransferProvider } from './RdpFileTransferProvider';
