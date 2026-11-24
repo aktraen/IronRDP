@@ -151,12 +151,8 @@ impl DecodingContext {
         // Clip to the decoded image, not to the RFX channel: after a Deactivation-Reactivation
         // resize some servers (xrdp) keep announcing the pre-resize channel size, which would
         // otherwise drop every tile in the newly exposed area.
-        let clipping_rectangles = clipping_rectangles(
-            region.rectangles.as_slice(),
-            destination,
-            image.width(),
-            image.height(),
-        );
+        let clipping_rectangles =
+            clipping_rectangles(region.rectangles.as_slice(), destination, image.width(), image.height());
         trace!("Clipping rectangles: {:?}", clipping_rectangles);
 
         let mut final_update_rectangle = clipping_rectangles.extents.clone();
