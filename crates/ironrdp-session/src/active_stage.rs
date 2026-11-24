@@ -47,6 +47,38 @@ pub struct ActiveStage {
     bulk_decompressor: Option<BulkCompressor>,
     enable_server_pointer: bool,
     window_support_level: Option<WindowSupportLevel>,
+    window_order_errors: WindowOrderErrors,
+}
+
+/// What [`ActiveStage`] does with a windowing orders update it cannot decode, or that uses fields
+/// the negotiated Window List support level does not allow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WindowOrderErrorPolicy {
+    /// Return the error from [`ActiveStage::process`], which ends most sessions (the default).
+    #[default]
+    Fail,
+    /// Drop the whole update and count it in [`ActiveStage::skipped_window_orders`].
+    Skip,
+}
+
+#[derive(Debug, Default)]
+struct WindowOrderErrors {
+    policy: WindowOrderErrorPolicy,
+    skipped: u64,
+}
+
+impl WindowOrderErrors {
+    fn handle(&mut self, forwarded: SessionResult<Vec<u8>>) -> SessionResult<Option<Vec<u8>>> {
+        match forwarded {
+            Ok(orders) => Ok(Some(orders)),
+            Err(error) if self.policy == WindowOrderErrorPolicy::Skip => {
+                self.skipped = self.skipped.saturating_add(1);
+                warn!(%error, skipped = self.skipped, "Skipped a windowing orders update");
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
 }
 
 /// Builder for [`ActiveStage`].
@@ -103,6 +135,7 @@ impl ActiveStageBuilder {
             bulk_decompressor: new_bulk_decompressor(compression_type),
             enable_server_pointer,
             window_support_level: None,
+            window_order_errors: WindowOrderErrors::default(),
         }
     }
 }
@@ -201,6 +234,7 @@ impl ActiveStage {
                                 &mut self.fast_path_processor,
                                 image,
                                 self.window_support_level,
+                                &mut self.window_order_errors,
                                 &data,
                             )?;
                             processor_updates.extend(updates);
@@ -241,9 +275,11 @@ impl ActiveStage {
             match update {
                 UpdateKind::None => {}
                 UpdateKind::Orders(data) => {
-                    if let Some(windowing_orders) =
-                        process_fast_path_windowing_orders(self.window_support_level, &data)?
-                    {
+                    if let Some(windowing_orders) = process_fast_path_windowing_orders(
+                        self.window_support_level,
+                        &mut self.window_order_errors,
+                        &data,
+                    )? {
                         stage_outputs.push(ActiveStageOutput::WindowingOrders(windowing_orders));
                     }
                 }
@@ -303,6 +339,23 @@ impl ActiveStage {
     /// `None` preserves desktop-session behavior by ignoring drawing orders.
     pub fn set_window_support_level(&mut self, window_support_level: Option<WindowSupportLevel>) {
         self.window_support_level = window_support_level;
+    }
+
+    /// Sets what happens to a windowing orders update that fails to decode or validate.
+    ///
+    /// The policy is kept across [`ActiveStage::reactivate`].
+    pub fn set_window_order_error_policy(&mut self, policy: WindowOrderErrorPolicy) {
+        self.window_order_errors.policy = policy;
+    }
+
+    /// Returns what happens to a windowing orders update that fails to decode or validate.
+    pub fn window_order_error_policy(&self) -> WindowOrderErrorPolicy {
+        self.window_order_errors.policy
+    }
+
+    /// Returns how many windowing orders updates [`WindowOrderErrorPolicy::Skip`] dropped.
+    pub fn skipped_window_orders(&self) -> u64 {
+        self.window_order_errors.skipped
     }
 
     /// Rebuilds the fast-path processor for a [Deactivation-Reactivation Sequence].
@@ -862,6 +915,7 @@ fn process_slow_path_graphics(
     fast_path_processor: &mut fast_path::Processor,
     image: &mut DecodedImage,
     window_support_level: Option<WindowSupportLevel>,
+    window_order_errors: &mut WindowOrderErrors,
     data: &[u8],
 ) -> SessionResult<(Vec<UpdateKind>, Option<Vec<u8>>)> {
     let mut src = ReadCursor::new(data);
@@ -878,9 +932,11 @@ fn process_slow_path_graphics(
             let Some(window_support_level) = window_support_level else {
                 return Ok((Vec::new(), None));
             };
-            let orders = try_decode_slow_path_windowing_orders(&mut src).map_err(SessionError::decode)?;
-            validate_windowing_orders_support(&orders, window_support_level)?;
-            Ok((Vec::new(), Some(data.to_vec())))
+            let forwarded = try_decode_slow_path_windowing_orders(&mut src)
+                .map_err(SessionError::decode)
+                .and_then(|orders| validate_windowing_orders_support(&orders, window_support_level))
+                .map(|()| data.to_vec());
+            Ok((Vec::new(), window_order_errors.handle(forwarded)?))
         }
         GraphicsUpdateType::Palette => {
             fast_path_processor.process_palette_update(data);
@@ -897,12 +953,20 @@ fn process_slow_path_graphics(
 
 fn process_fast_path_windowing_orders(
     window_support_level: Option<WindowSupportLevel>,
+    window_order_errors: &mut WindowOrderErrors,
     data: &[u8],
 ) -> SessionResult<Option<Vec<u8>>> {
     let Some(window_support_level) = window_support_level else {
         return Ok(None);
     };
 
+    window_order_errors.handle(normalize_fast_path_windowing_orders(window_support_level, data))
+}
+
+fn normalize_fast_path_windowing_orders(
+    window_support_level: WindowSupportLevel,
+    data: &[u8],
+) -> SessionResult<Vec<u8>> {
     let mut src = ReadCursor::new(data);
     let orders = try_decode_fast_path_windowing_orders(&mut src).map_err(SessionError::decode)?;
     validate_windowing_orders_support(&orders, window_support_level)?;
@@ -915,7 +979,7 @@ fn process_fast_path_windowing_orders(
     normalized.extend_from_slice(&data[..2]);
     normalized.extend_from_slice(&0u16.to_le_bytes());
     normalized.extend_from_slice(&data[2..]);
-    Ok(Some(normalized))
+    Ok(normalized)
 }
 
 fn validate_windowing_orders_support(
@@ -1201,9 +1265,14 @@ mod tests {
         .build();
         let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
 
-        let (palette_updates, windowing_orders) =
-            process_slow_path_graphics(&mut processor, &mut image, None, &palette_data)
-                .expect("slow-path palette update should succeed");
+        let (palette_updates, windowing_orders) = process_slow_path_graphics(
+            &mut processor,
+            &mut image,
+            None,
+            &mut WindowOrderErrors::default(),
+            &palette_data,
+        )
+        .expect("slow-path palette update should succeed");
         assert!(palette_updates.is_empty());
         assert!(windowing_orders.is_none());
 
@@ -1265,12 +1334,24 @@ mod tests {
         let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
         let update = slow_path_orders_update(&window_order(0x2100_0000));
 
-        let (_, orders) = process_slow_path_graphics(&mut processor, &mut image, None, &update).unwrap();
+        let (_, orders) = process_slow_path_graphics(
+            &mut processor,
+            &mut image,
+            None,
+            &mut WindowOrderErrors::default(),
+            &update,
+        )
+        .unwrap();
         assert!(orders.is_none());
 
-        let (_, orders) =
-            process_slow_path_graphics(&mut processor, &mut image, Some(WindowSupportLevel::Supported), &update)
-                .unwrap();
+        let (_, orders) = process_slow_path_graphics(
+            &mut processor,
+            &mut image,
+            Some(WindowSupportLevel::Supported),
+            &mut WindowOrderErrors::default(),
+            &update,
+        )
+        .unwrap();
         assert_eq!(orders.as_deref(), Some(update.as_slice()));
     }
 
@@ -1281,9 +1362,13 @@ mod tests {
         update.extend_from_slice(&1u16.to_le_bytes());
         update.extend_from_slice(&order);
 
-        let normalized = process_fast_path_windowing_orders(Some(WindowSupportLevel::Supported), &update)
-            .unwrap()
-            .unwrap();
+        let normalized = process_fast_path_windowing_orders(
+            Some(WindowSupportLevel::Supported),
+            &mut WindowOrderErrors::default(),
+            &update,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
             normalized,
             [
@@ -1310,17 +1395,120 @@ mod tests {
         let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
 
         assert!(
-            process_slow_path_graphics(&mut processor, &mut image, Some(WindowSupportLevel::Supported), &update)
-                .is_err()
+            process_slow_path_graphics(
+                &mut processor,
+                &mut image,
+                Some(WindowSupportLevel::Supported),
+                &mut WindowOrderErrors::default(),
+                &update,
+            )
+            .is_err()
         );
         assert!(
             process_slow_path_graphics(
                 &mut processor,
                 &mut image,
                 Some(WindowSupportLevel::SupportedEx),
+                &mut WindowOrderErrors::default(),
                 &update
             )
             .is_ok()
+        );
+    }
+
+    fn malformed_window_order() -> Vec<u8> {
+        let mut order = window_order(0x2100_0000);
+        order[1] = 12;
+        order
+    }
+
+    fn fast_path_orders_frame(order: &[u8]) -> Vec<u8> {
+        let mut orders = 1u16.to_le_bytes().to_vec();
+        orders.extend_from_slice(order);
+        let mut frame = encode_vec(&ironrdp_pdu::fast_path::FastPathHeader::new(
+            ironrdp_pdu::fast_path::EncryptionFlags::empty(),
+            1 /* update header */ + 2 /* size */ + orders.len(),
+        ))
+        .unwrap();
+        frame.push(ironrdp_pdu::fast_path::UpdateCode::Orders.as_u8());
+        frame.extend_from_slice(&u16::try_from(orders.len()).unwrap().to_le_bytes());
+        frame.extend_from_slice(&orders);
+        frame
+    }
+
+    #[test]
+    fn window_order_errors_fail_by_default_and_are_skipped_on_request() {
+        let mut processor = fast_path::ProcessorBuilder {
+            io_channel_id: 0,
+            user_channel_id: 0,
+            share_id: 0,
+            enable_server_pointer: false,
+            pointer_software_rendering: false,
+        }
+        .build();
+        let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
+        let malformed = slow_path_orders_update(&malformed_window_order());
+        let extended = slow_path_orders_update(&window_order(0x0101_0000));
+        let mut fast_path = 1u16.to_le_bytes().to_vec();
+        fast_path.extend_from_slice(&malformed_window_order());
+
+        let mut fail = WindowOrderErrors::default();
+        let level = Some(WindowSupportLevel::Supported);
+        assert!(process_slow_path_graphics(&mut processor, &mut image, level, &mut fail, &malformed).is_err());
+        assert!(process_slow_path_graphics(&mut processor, &mut image, level, &mut fail, &extended).is_err());
+        assert!(process_fast_path_windowing_orders(level, &mut fail, &fast_path).is_err());
+        assert_eq!(fail.skipped, 0);
+
+        let mut skip = WindowOrderErrors {
+            policy: WindowOrderErrorPolicy::Skip,
+            skipped: 0,
+        };
+        let (_, orders) = process_slow_path_graphics(&mut processor, &mut image, level, &mut skip, &malformed).unwrap();
+        assert!(orders.is_none());
+        let (_, orders) = process_slow_path_graphics(&mut processor, &mut image, level, &mut skip, &extended).unwrap();
+        assert!(orders.is_none());
+        assert!(
+            process_fast_path_windowing_orders(level, &mut skip, &fast_path)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(skip.skipped, 3);
+
+        let valid = slow_path_orders_update(&window_order(0x2100_0000));
+        let (_, orders) = process_slow_path_graphics(&mut processor, &mut image, level, &mut skip, &valid).unwrap();
+        assert_eq!(orders.as_deref(), Some(valid.as_slice()));
+        assert_eq!(skip.skipped, 3);
+    }
+
+    #[test]
+    fn skip_policy_survives_reactivation() {
+        let mut stage = active_stage_with_ready_dvcs();
+        let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
+        stage.set_window_support_level(Some(WindowSupportLevel::Supported));
+        let malformed = fast_path_orders_frame(&malformed_window_order());
+        assert_eq!(stage.window_order_error_policy(), WindowOrderErrorPolicy::Fail);
+        assert!(stage.process(&mut image, Action::FastPath, &malformed).is_err());
+
+        stage.set_window_order_error_policy(WindowOrderErrorPolicy::Skip);
+        let outputs = stage.process(&mut image, Action::FastPath, &malformed).unwrap();
+        assert!(
+            !outputs
+                .iter()
+                .any(|output| matches!(output, ActiveStageOutput::WindowingOrders(_)))
+        );
+        assert_eq!(stage.skipped_window_orders(), 1);
+
+        assert!(stage.reactivate(1003, 1001, 2, false, false, 1600));
+        assert_eq!(stage.window_order_error_policy(), WindowOrderErrorPolicy::Skip);
+        assert!(stage.process(&mut image, Action::FastPath, &malformed).is_ok());
+        assert_eq!(stage.skipped_window_orders(), 2);
+
+        let valid = fast_path_orders_frame(&window_order(0x2100_0000));
+        let outputs = stage.process(&mut image, Action::FastPath, &valid).unwrap();
+        assert!(
+            outputs
+                .iter()
+                .any(|output| matches!(output, ActiveStageOutput::WindowingOrders(_)))
         );
     }
 
