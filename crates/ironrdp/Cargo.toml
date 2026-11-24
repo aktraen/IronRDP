@@ -82,6 +82,7 @@ ironrdp-vmconnect = { path = "../ironrdp-vmconnect", version = "0.1", optional =
 [dev-dependencies]
 ironrdp-blocking = { path = "../ironrdp-blocking", version = "0.10" }
 ironrdp-cliprdr-native = { path = "../ironrdp-cliprdr-native", version = "0.7" }
+ironrdp-rail = { path = "../ironrdp-rail", version = "0.1" }
 anyhow = "1"
 async-trait = "0.1"
 image = { version = "0.25", default-features = false, features = ["png"] }
@@ -102,6 +103,10 @@ all-features = true
 [[example]]
 name = "screenshot"
 doc-scrape-examples = true
+required-features = ["session", "connector", "graphics"]
+
+[[example]]
+name = "railprobe"
 required-features = ["session", "connector", "graphics"]
 
 [[example]]

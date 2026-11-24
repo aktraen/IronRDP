@@ -2573,6 +2573,7 @@ dependencies = [
  "ironrdp-input",
  "ironrdp-mstsgu",
  "ironrdp-pdu",
+ "ironrdp-rail",
  "ironrdp-rdpdr",
  "ironrdp-rdpei",
  "ironrdp-rdpsnd",
