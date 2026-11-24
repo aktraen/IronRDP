@@ -1273,6 +1273,34 @@ mod tests {
     }
 
     #[test]
+    fn long_title_keeps_the_following_fields() {
+        let DecodedWindowingOrder::Window(mut order) = decode_one(&XRDP_NEW_WINDOW_ORDER) else {
+            panic!("expected a window order");
+        };
+        order.title = Some("y".repeat(700));
+        let forwarded = encode_forwarded_windowing_orders(&[DecodedWindowingOrder::Window(order.clone())]).unwrap();
+
+        let validated = try_decode_slow_path_windowing_orders(&mut ReadCursor::new(&forwarded[2..])).unwrap();
+        assert!(!validated.contains_non_window_orders);
+        order.title = Some("y".repeat(MAX_TITLE_CODE_UNITS));
+        assert_eq!(
+            decode_forwarded_windowing_orders(&forwarded).unwrap(),
+            [DecodedWindowingOrder::Window(order)]
+        );
+    }
+
+    #[test]
+    fn odd_title_length_is_rejected_by_both_decoders() {
+        let mut fields = 7u32.to_le_bytes().to_vec();
+        fields.extend_from_slice(&3u16.to_le_bytes());
+        fields.extend_from_slice(&[0x41, 0, 0]);
+        let order = order_bytes(WINDOW_TYPE | FIELD_TITLE, &fields);
+
+        assert!(WindowingOrder::decode(&mut ReadCursor::new(&order)).is_err());
+        assert!(decode_windowing_order(&mut ReadCursor::new(&order)).is_err());
+    }
+
+    #[test]
     fn decodes_desktop_active_window_and_zorder() {
         assert_eq!(
             decode_one(&desktop_order()),

@@ -286,9 +286,10 @@ impl RailWindowTracker {
 
     /// Deletes the windows the server sent no order for since [`Self::begin_resync`].
     ///
-    /// xrdp only re-sends mapped windows, so a window it unmapped (minimized) is deleted here. A
-    /// pruned window that the server later updates without `STATE_NEW` stays unknown until the
-    /// server announces it as new again.
+    /// xrdp only re-sends mapped windows, so a window it unmapped (minimized) is deleted here, and
+    /// so are override-redirect popups (menus, tooltips) open during an Execute, which its restore
+    /// skips; xrdp announces those as new again the next time they map. A pruned window that the
+    /// server later updates without `STATE_NEW` stays unknown until it is announced as new again.
     pub fn end_resync(&mut self) -> Vec<RailWindowEvent> {
         let Some(seen) = self.resync_seen.take() else {
             return Vec::new();
@@ -357,10 +358,13 @@ impl RailWindowTracker {
     fn apply_window(&mut self, info: WindowInfoOrder) -> Option<RailWindowEvent> {
         let id = info.window_id;
         let is_new = info.is_new;
-        if let Some(seen) = self.resync_seen.as_mut() {
+        let full = self.windows.len() >= MAX_WINDOWS;
+        // Only tracked or newly accepted windows are recorded, so the set stays within the cap.
+        if let Some(seen) = self.resync_seen.as_mut()
+            && (self.windows.contains_key(&id) || (is_new && !full))
+        {
             seen.insert(id);
         }
-        let full = self.windows.len() >= MAX_WINDOWS;
         match self.windows.get_mut(&id) {
             Some(tracked) => {
                 tracked.raw.merge(info);
@@ -407,7 +411,7 @@ mod tests {
         WindowStyles, encode_forwarded_windowing_orders,
     };
 
-    use super::{RailRect, RailWindowChanges, RailWindowEvent, RailWindowRole, RailWindowTracker};
+    use super::{MAX_WINDOWS, RailRect, RailWindowChanges, RailWindowEvent, RailWindowRole, RailWindowTracker};
 
     const ROOT: u32 = 0x221;
 
@@ -749,6 +753,58 @@ mod tests {
             tracker.apply(app(599, "w")),
             Some(RailWindowEvent::Created(_))
         ));
+    }
+
+    fn retitled(id: u32, title: &str) -> DecodedWindowingOrder {
+        DecodedWindowingOrder::Window(WindowInfoOrder {
+            window_id: id,
+            title: Some(title.to_owned()),
+            ..WindowInfoOrder::default()
+        })
+    }
+
+    #[test]
+    fn cap_still_allows_updates_and_deletes() {
+        let mut tracker = RailWindowTracker::new();
+        for id in 0..u32::try_from(MAX_WINDOWS).unwrap() {
+            assert!(matches!(tracker.apply(app(id, "w")), Some(RailWindowEvent::Created(_))));
+        }
+        assert_eq!(tracker.apply(app(9999, "w")), None);
+        assert!(matches!(
+            tracker.apply(retitled(5, "x")),
+            Some(RailWindowEvent::Updated { .. })
+        ));
+        assert!(matches!(
+            tracker.apply(app(5, "w")),
+            Some(RailWindowEvent::Updated { reannounced: true, .. })
+        ));
+        assert_eq!(
+            tracker.apply(DecodedWindowingOrder::WindowDeleted { window_id: 5 }),
+            Some(RailWindowEvent::Deleted { id: 5 })
+        );
+        assert!(matches!(
+            tracker.apply(app(9999, "w")),
+            Some(RailWindowEvent::Created(_))
+        ));
+    }
+
+    #[test]
+    fn resync_ignores_untracked_ids() {
+        let mut tracker = RailWindowTracker::new();
+        tracker.apply(app(1, "w"));
+        for id in 2..=u32::try_from(MAX_WINDOWS).unwrap() {
+            tracker.apply(app(id, "w"));
+        }
+        tracker.begin_resync();
+        for id in 1_000_000..1_020_000u32 {
+            assert_eq!(tracker.apply(retitled(id, "")), None);
+            assert_eq!(tracker.apply(app(id, "flood")), None);
+        }
+        tracker.apply(retitled(1, "still here"));
+
+        assert!(tracker.resync_seen.as_ref().unwrap().len() <= MAX_WINDOWS);
+        assert_eq!(tracker.end_resync().len(), MAX_WINDOWS - 1);
+        assert_eq!(tracker.windows().map(|window| window.id).collect::<Vec<_>>(), [1]);
     }
 
     struct Lcg(u64);
