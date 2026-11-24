@@ -75,7 +75,7 @@ impl RailWindowChanges {
 pub enum RailWindowEvent {
     Created(RailWindow),
     /// `reannounced` is set when the server sent the window again as new, which xrdp does for
-    /// every mapped window after each Execute.
+    /// every mapped window after each Execute (a work area alone re-sends them as plain updates).
     Updated {
         window: RailWindow,
         changes: RailWindowChanges,
@@ -264,7 +264,11 @@ impl RailWindowTracker {
         self.windows.get(&id).map(|window| &window.snapshot)
     }
 
-    /// Starts collecting the windows the server re-announces after it restarted its RAIL state.
+    /// Starts collecting the windows the server sends again, after it restarted its RAIL state or
+    /// received a new work area.
+    ///
+    /// Any order for a window counts: xrdp re-sends a window with `STATE_NEW` only when an Execute
+    /// cleared its window list, and without it when the client merely sent a work area.
     pub fn begin_resync(&mut self) {
         self.resync_seen = Some(BTreeSet::new());
     }
@@ -274,7 +278,11 @@ impl RailWindowTracker {
         self.resync_seen.is_some()
     }
 
-    /// Deletes the windows the server did not re-announce since [`Self::begin_resync`].
+    /// Deletes the windows the server sent no order for since [`Self::begin_resync`].
+    ///
+    /// xrdp only re-sends mapped windows, so a window it unmapped (minimized) is deleted here. A
+    /// pruned window that the server later updates without `STATE_NEW` stays unknown until the
+    /// server announces it as new again.
     pub fn end_resync(&mut self) -> Vec<RailWindowEvent> {
         let Some(seen) = self.resync_seen.take() else {
             return Vec::new();
@@ -302,7 +310,7 @@ impl RailWindowTracker {
     fn apply_window(&mut self, info: WindowInfoOrder) -> Option<RailWindowEvent> {
         let id = info.window_id;
         let is_new = info.is_new;
-        if is_new && let Some(seen) = self.resync_seen.as_mut() {
+        if let Some(seen) = self.resync_seen.as_mut() {
             seen.insert(id);
         }
         match self.windows.get_mut(&id) {
@@ -592,7 +600,6 @@ mod tests {
         tracker.begin_resync();
         assert!(tracker.is_resyncing());
         tracker.apply(app(7, "Wireshark"));
-        tracker.apply(configure(8, 0, 0, 10, 10));
 
         assert_eq!(tracker.end_resync(), [RailWindowEvent::Deleted { id: 8 }]);
         assert!(!tracker.is_resyncing());
@@ -600,6 +607,84 @@ mod tests {
 
         tracker.clear();
         assert_eq!(tracker.windows().count(), 0);
+    }
+
+    fn resent(id: u32, title: &str) -> DecodedWindowingOrder {
+        let DecodedWindowingOrder::Window(mut order) = app(id, title) else {
+            unreachable!("app() builds a window order");
+        };
+        order.is_new = false;
+        DecodedWindowingOrder::Window(order)
+    }
+
+    /// xrdp's `rail_restore_windows` re-sends a window still in its list without `STATE_NEW`, so a
+    /// client-initiated resync (work area only, no Execute) sees only plain updates.
+    #[test]
+    fn client_resync_keeps_windows_xrdp_reannounces_without_state_new() {
+        let mut tracker = RailWindowTracker::new();
+        tracker.apply(app(7, "xterm"));
+        tracker.apply(app(8, "Wireshark"));
+
+        tracker.begin_resync();
+        tracker.apply(resent(7, "xterm"));
+        tracker.apply(configure(8, 0, 0, 10, 10));
+        let pruned = tracker.end_resync();
+
+        assert!(pruned.is_empty(), "live windows pruned: {pruned:?}");
+        assert_eq!(tracker.windows().count(), 2);
+    }
+
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 33
+        }
+
+        fn below(&mut self, bound: usize) -> usize {
+            usize::try_from(self.next()).unwrap() % bound
+        }
+
+        fn byte(&mut self) -> u8 {
+            u8::try_from(self.next() & 0xFF).unwrap()
+        }
+    }
+
+    #[test]
+    fn hostile_orders_never_panic() {
+        let seed = encode_forwarded_windowing_orders(&[
+            app(7, "xterm"),
+            DecodedWindowingOrder::WindowDeleted { window_id: 7 },
+            resent(8, "t"),
+        ])
+        .unwrap();
+        let mut rng = Lcg(0x5eed);
+        let mut tracker = RailWindowTracker::new();
+        for round in 0..50_000u32 {
+            let mut data = seed.clone();
+            for _ in 0..=rng.below(8) {
+                let index = rng.below(data.len());
+                data[index] = rng.byte();
+            }
+            if round % 7 == 0 {
+                data.truncate(rng.below(data.len()));
+            }
+            tracker.apply_update(&data);
+            if round % 1000 == 0 {
+                tracker.begin_resync();
+            }
+            if round % 1000 == 500 {
+                tracker.end_resync();
+            }
+        }
+        let random = core::iter::repeat_with(|| rng.byte()).take(4096).collect::<Vec<_>>();
+        for start in 0..random.len() {
+            tracker.apply_update(&random[start..]);
+        }
     }
 
     #[test]
