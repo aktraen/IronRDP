@@ -65,7 +65,10 @@ export interface UserInteraction {
     /** Moves the remote pointer; coordinates are rounded and clamped to the desktop. */
     sendPointerMove(x: number, y: number): void;
 
-    /** Presses or releases a pointer button (DOM numbering: 0 left, 1 middle, 2 right). */
+    /**
+     * Presses or releases a pointer button (DOM numbering: 0 left, 1 middle, 2 right, 3 back, 4 forward);
+     * any other value is ignored.
+     */
     sendPointerButton(button: number, pressed: boolean): void;
 
     /** Forwards a wheel event, quantized into notches like the canvas. */

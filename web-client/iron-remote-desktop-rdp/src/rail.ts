@@ -4,6 +4,10 @@
  * `remoteApp()` and the three callbacks are builder extensions (`configBuilder().withExtension()`); the
  * `rail*` operations are session extensions (`invokeExtension()`), which throw when the session is not a
  * RemoteApp session. All coordinates are desktop pixels, the same space as `renderCanvas()`.
+ *
+ * Geometry belongs to the host: xrdp applies `railWindowMove()` but never reports a move or resize back,
+ * nor one the application makes itself. The session applies each `railWindowMove()` to its own window
+ * state and reports it as an `updated` event with `local: true`.
  */
 
 import { Extension } from '../../../crates/ironrdp-web/pkg/ironrdp_web';
@@ -31,7 +35,10 @@ export interface RailRect {
 
 export interface RailWindowSnapshot {
     id: number;
-    /** The owning window, or `null` for a top-level window. */
+    /**
+     * The owning window, or `null` for a top-level window. It may name a window that is not (or no longer)
+     * known; hosts show such a dialog as an ownerless window.
+     */
     ownerId: number | null;
     role: RailWindowRole;
     showState: RailShowState;
@@ -55,20 +62,30 @@ export type RailWindowEvent =
           id: number;
           window: RailWindowSnapshot;
           changed: RailWindowChange[];
-          /** The server sent the window again as new (xrdp does after every launch and work area). */
+          /**
+           * The server sent the window again as new: xrdp does for every mapped window after each launch
+           * (a work area alone re-sends windows as plain updates).
+           */
           reannounced: boolean;
+          /** The change comes from this client's own `railWindowMove()`, not from the server. */
+          local: boolean;
       }
     | { kind: 'deleted'; id: number };
 
-export type RailState = 'initiating' | 'established' | 'resyncing' | 'exhausted';
+/**
+ * `exhausted`: the server never answered the initiation; `unavailable`: the server did not join the RAIL
+ * channel (or it cannot be used). Neither ends the session; nothing is sent any more.
+ */
+export type RailState = 'initiating' | 'established' | 'resyncing' | 'exhausted' | 'unavailable';
 
 export interface RailStateEvent {
     state: RailState;
     /** Initiation attempts so far. */
     attempt: number;
+    /** The desktop size, which is also the work area sent to the server (the whole desktop). */
     desktopWidth: number;
     desktopHeight: number;
-    /** Set when the server violated the protocol and the PDU was ignored. */
+    /** Why RAIL is `unavailable`, or a server protocol violation that was ignored. */
     warning?: string;
 }
 
@@ -194,7 +211,12 @@ export function railActivate(id: number, enabled = true): Extension {
     return new Extension('rail_activate', { id: windowId(id), enabled: enabled === true });
 }
 
-/** Sends a system command; xrdp closes on `close`, unmaps on `minimize` and ignores `maximize`. */
+/**
+ * Sends a system command. On xrdp, `close` asks the application to close (the window stays until its
+ * `deleted` event), `maximize` is ignored, and `minimize` unmaps the window: xrdp then forgets it at the next
+ * launch and never re-sends it, so the window is orphaned. Hosts minimize by moving the window off-screen
+ * with `railWindowMove()` instead.
+ */
 export function railSysCommand(id: number, command: RailSysCommand): Extension {
     if (!SYS_COMMANDS.includes(command)) {
         fail(`unknown RAIL system command: ${String(command)}`);
@@ -202,12 +224,15 @@ export function railSysCommand(id: number, command: RailSysCommand): Extension {
     return new Extension('rail_sys_command', { id: windowId(id), command });
 }
 
-/** Moves and resizes a window; every edge must fit in a signed 16-bit coordinate. */
+/**
+ * Moves and resizes a window (at least 1x1; every edge must fit in a signed 16-bit coordinate). The server
+ * never confirms it; the session reports it at once as an `updated` event with `local: true`.
+ */
 export function railWindowMove(id: number, rect: RailRect): Extension {
     const left = requireInteger('left', rect.left, I16_MIN, I16_MAX);
     const top = requireInteger('top', rect.top, I16_MIN, I16_MAX);
-    const width = requireInteger('width', rect.width, 0, I16_MAX - left);
-    const height = requireInteger('height', rect.height, 0, I16_MAX - top);
+    const width = requireInteger('width', rect.width, 1, I16_MAX - left);
+    const height = requireInteger('height', rect.height, 1, I16_MAX - top);
     return new Extension('rail_window_move', { id: windowId(id), left, top, width, height });
 }
 
@@ -219,7 +244,11 @@ export function railSetWorkArea(width: number, height: number): Extension {
     });
 }
 
-/** Asks the server to re-announce its windows; windows it does not re-announce are deleted. */
+/**
+ * Sends the work area again so the server re-sends every window it still maps; after about 5 to 10 s, windows
+ * it did not re-send (for example ones it unmapped) are deleted. A deleted window the server later updates
+ * stays unknown until it is announced as new again.
+ */
 export function railResync(): Extension {
     return new Extension('rail_resync', true);
 }

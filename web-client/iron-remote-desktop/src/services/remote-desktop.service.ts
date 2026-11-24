@@ -241,9 +241,10 @@ export class RemoteDesktopService {
         });
     }
 
-    /// Presses or releases a pointer button (DOM numbering: 0 left, 1 middle, 2 right).
+    /// Presses or releases a pointer button (DOM numbering: 0 left, 1 middle, 2 right, 3 back,
+    /// 4 forward); any other value is ignored.
     sendPointerButton(button: number, pressed: boolean) {
-        if (!this.session) return;
+        if (!this.session || !Number.isInteger(button) || button < 0 || button > 4) return;
         const device = this.module.DeviceEvent;
         this.doTransactionFromDeviceEvents([
             pressed ? device.mouseButtonPressed(button) : device.mouseButtonReleased(button),

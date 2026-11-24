@@ -130,6 +130,7 @@ export class PublicAPI {
     }
 
     private sendKeyboardEvent(event: KeyboardEvent) {
+        if (this.remoteDesktopService.session == null) return;
         this.remoteDesktopService.sendKeyboardEvent(event);
     }
 

@@ -76,6 +76,8 @@ describe('RemoteApp extensions', () => {
         expect(() => rail.railWindowMove(7, { left: 32000, top: 0, width: 800, height: 600 })).toThrow(/width/);
         expect(() => rail.railWindowMove(7, { left: -40000, top: 0, width: 1, height: 1 })).toThrow(/left/);
         expect(() => rail.railWindowMove(7, { left: 0, top: 0.5, width: 1, height: 1 })).toThrow(/top/);
+        expect(() => rail.railWindowMove(7, { left: 0, top: 0, width: 0, height: 1 })).toThrow(/width/);
+        expect(() => rail.railWindowMove(7, { left: 0, top: 0, width: 1, height: 0 })).toThrow(/height/);
         expect(() => rail.railWindowMove(-1, { left: 0, top: 0, width: 1, height: 1 })).toThrow(/window id/);
     });
 

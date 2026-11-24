@@ -183,6 +183,17 @@ describe('external input API', () => {
             api.sendWheel(new WheelEvent('wheel', { deltaY: 100 }));
             api.releaseAllInputs();
         }).not.toThrow();
+        const keydown = new KeyboardEvent('keydown', { code: 'KeyV', key: 'v', cancelable: true });
+        api.sendKeyboardEvent(keydown);
+        expect(keydown.defaultPrevented).toBe(false);
         expect(session.applyInputs).not.toHaveBeenCalled();
+    });
+
+    it('ignores pointer buttons outside 0..4', () => {
+        api.sendPointerButton(5, true);
+        api.sendPointerButton(-1, true);
+        api.sendPointerButton(1.5, true);
+        api.sendPointerButton(4, true);
+        expect(sentEvents()).toEqual([{ type: 'pressed', id: 4 }]);
     });
 });
