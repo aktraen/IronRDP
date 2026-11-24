@@ -163,6 +163,8 @@ pub struct RailClient {
     build_number: u32,
     desktop_width: u16,
     desktop_height: u16,
+    /// A work area set with [`Self::set_work_area`]; the whole desktop otherwise.
+    work_area: Option<SystemParameterRectangle>,
     client_status_flags: u32,
     server_compat: RailServerCompat,
     max_initiation_attempts: u32,
@@ -187,6 +189,7 @@ impl RailClient {
             build_number,
             desktop_width,
             desktop_height,
+            work_area: None,
             client_status_flags: ClientStatusPdu::Z_ORDER_SYNC
                 | ClientStatusPdu::POWER_DISPLAY_REQUEST
                 | ClientStatusPdu::BIDIRECTIONAL_CLOAK,
@@ -315,11 +318,33 @@ impl RailClient {
         Ok(messages.into())
     }
 
-    /// Updates the RAIL work area after the client desktop size changes.
+    /// Updates the display after the client desktop size changes; the work area becomes the
+    /// whole new desktop again.
     pub fn update_desktop_size(&mut self, desktop_width: u16, desktop_height: u16) -> RailSvcMessages {
         self.desktop_width = desktop_width;
         self.desktop_height = desktop_height;
+        self.work_area = None;
         self.request_work_area()
+    }
+
+    /// Sets a work area other than the whole desktop and sends it alone (no display change) once
+    /// established; it is also sent with every later display change.
+    pub fn set_work_area(&mut self, work_area: SystemParameterRectangle) -> RailSvcMessages {
+        self.work_area = Some(work_area);
+        if !self.is_established() {
+            return Vec::new().into();
+        }
+        vec![Self::service_message(RailPdu::ClientSystemParameters(
+            ClientSystemParametersPdu {
+                parameter: ClientSystemParameter::WorkArea(work_area),
+            },
+        ))]
+        .into()
+    }
+
+    /// Returns the work area sent to the server.
+    pub fn work_area(&self) -> SystemParameterRectangle {
+        self.work_area.unwrap_or_else(|| self.screen())
     }
 
     /// Sends the current display and work area again once established.
@@ -341,6 +366,13 @@ impl RailClient {
     fn queue_pdu(&mut self, pdu: QueuedRailPdu) -> PduResult<RailSvcMessages> {
         Self::validate_queued_pdu(&pdu)?;
         if !self.is_established() || !self.desktop_synchronized {
+            // Only the latest move of a window is worth replaying.
+            if let QueuedRailPdu::Input(RailInputEvent::WindowMove(window_move)) = &pdu {
+                let window_id = window_move.window_id;
+                self.queued_pdus.retain(|queued| {
+                    !matches!(queued, QueuedRailPdu::Input(RailInputEvent::WindowMove(queued_move)) if queued_move.window_id == window_id)
+                });
+            }
             if self.queued_pdus.len() >= Self::MAX_QUEUED_PDUS {
                 return Err(Self::resource_limit_error("queued RAIL PDUs"));
             }
@@ -396,16 +428,19 @@ impl RailClient {
         messages
     }
 
-    fn desktop_system_parameter_messages(&self) -> Vec<SvcMessage> {
-        let screen = SystemParameterRectangle {
+    fn screen(&self) -> SystemParameterRectangle {
+        SystemParameterRectangle {
             left: 0,
             top: 0,
             right: self.desktop_width,
             bottom: self.desktop_height,
-        };
+        }
+    }
+
+    fn desktop_system_parameter_messages(&self) -> Vec<SvcMessage> {
         [
-            ClientSystemParameter::DisplayChange(screen),
-            ClientSystemParameter::WorkArea(screen),
+            ClientSystemParameter::DisplayChange(self.screen()),
+            ClientSystemParameter::WorkArea(self.work_area()),
         ]
         .into_iter()
         .map(|parameter| {
@@ -920,6 +955,63 @@ mod tests {
                 }
             ]
         ));
+    }
+
+    #[test]
+    fn queued_window_moves_are_coalesced_per_window() {
+        let mut client = xrdp_client();
+        client.initiate(execute("/usr/bin/true")).unwrap();
+        let window_move = |window_id: u32, left: i16| {
+            RailInputEvent::WindowMove(WindowMovePdu {
+                window_id,
+                rectangle: Rectangle {
+                    left,
+                    top: 0,
+                    right: left + 10,
+                    bottom: 10,
+                },
+            })
+        };
+        for left in 0..200 {
+            client.queue_input(window_move(7, left)).unwrap();
+            client.queue_input(window_move(8, left)).unwrap();
+        }
+
+        let reply = decode_all(client.process(&XRDP_HANDSHAKE).unwrap());
+
+        assert_eq!(
+            reply[2..],
+            [RailPdu::from(window_move(7, 199)), RailPdu::from(window_move(8, 199))]
+        );
+    }
+
+    #[test]
+    fn work_area_is_kept_apart_from_the_desktop() {
+        let mut client = established_xrdp_client();
+        let area = SystemParameterRectangle {
+            left: 0,
+            top: 0,
+            right: 1600,
+            bottom: 860,
+        };
+
+        assert_eq!(
+            decode_all(client.set_work_area(area)),
+            [RailPdu::ClientSystemParameters(ClientSystemParametersPdu {
+                parameter: ClientSystemParameter::WorkArea(area),
+            })]
+        );
+        let [display, _] = work_area(1600, 900);
+        assert_eq!(
+            decode_all(client.request_work_area()),
+            [
+                display,
+                RailPdu::ClientSystemParameters(ClientSystemParametersPdu {
+                    parameter: ClientSystemParameter::WorkArea(area),
+                })
+            ]
+        );
+        assert_eq!(decode_all(client.update_desktop_size(1280, 720)), work_area(1280, 720));
     }
 
     #[test]
