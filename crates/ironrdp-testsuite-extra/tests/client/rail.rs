@@ -1,10 +1,11 @@
-use ironrdp_client::rail::{RailClient, RailEvent};
+use ironrdp_client::rail::{RailClient, RailEvent, RailInputEvent};
 use ironrdp_core::{decode, encode_vec};
+use ironrdp_rail::client::RailServerCompat;
 use ironrdp_rail::pdu::{
     ClientStatusPdu, ClientSystemParameter, ClientSystemParametersPdu, ExecutePdu, HandshakePdu, RailPdu,
-    SystemParameterRectangle,
+    SystemCommand, SystemCommandPdu, SystemParameterRectangle,
 };
-use ironrdp_svc::SvcProcessor as _;
+use ironrdp_svc::{SvcMessage, SvcProcessor as _};
 
 #[test]
 fn queued_execute_is_released_after_handshake_fallback() {
@@ -153,5 +154,102 @@ fn desktop_size_update_sends_display_change_and_work_area() {
                 ..
             })
         })
+    ));
+}
+
+fn sent(messages: impl Into<Vec<SvcMessage>>) -> Vec<RailPdu> {
+    messages
+        .into()
+        .iter()
+        .map(|message| decode::<RailPdu>(&message.encode_unframed_pdu().unwrap()).unwrap())
+        .collect()
+}
+
+fn launch(executable: &str) -> ExecutePdu {
+    ExecutePdu {
+        flags: 0,
+        executable: executable.to_owned(),
+        working_directory: String::new(),
+        arguments: String::new(),
+    }
+}
+
+fn work_area(width: u16, height: u16) -> Vec<RailPdu> {
+    let screen = SystemParameterRectangle {
+        left: 0,
+        top: 0,
+        right: width,
+        bottom: height,
+    };
+    vec![
+        RailPdu::ClientSystemParameters(ClientSystemParametersPdu {
+            parameter: ClientSystemParameter::DisplayChange(screen),
+        }),
+        RailPdu::ClientSystemParameters(ClientSystemParametersPdu {
+            parameter: ClientSystemParameter::WorkArea(screen),
+        }),
+    ]
+}
+
+#[test]
+fn xrdp_compat_full_launch_sequence() {
+    const XRDP_HANDSHAKE: [u8; 8] = [0x05, 0x00, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00];
+
+    let mut client = RailClient::new(7601, 1600, 900)
+        .with_server_compat(RailServerCompat::XRDP)
+        .with_client_status_flags(ClientStatusPdu::ALLOW_LOCAL_MOVE_SIZE);
+
+    // xrdp stays silent until a client Execute reaches it, so the client starts and retries.
+    let bootstrap = sent(client.initiate(launch("/usr/bin/true")).unwrap());
+    assert_eq!(bootstrap.len(), 3);
+    assert!(matches!(bootstrap[2], RailPdu::Execute(_)));
+    assert_eq!(sent(client.resend_initiation().unwrap()), bootstrap);
+    assert!(
+        sent(
+            client
+                .queue_execute(launch("/usr/local/lib/aktraen/apps/wireshark"))
+                .unwrap()
+        )
+        .is_empty()
+    );
+
+    // The bootstrap Execute runs rail_startup, which sends a Handshake with a body-only length.
+    let mut expected = work_area(1600, 900);
+    expected.push(RailPdu::Execute(launch("/usr/local/lib/aktraen/apps/wireshark")));
+    assert_eq!(sent(client.process(&XRDP_HANDSHAKE).unwrap()), expected);
+    assert!(sent(client.resend_initiation().unwrap()).is_empty());
+
+    // That Execute runs rail_startup again; the work area makes xrdp restore its mapped windows.
+    assert_eq!(sent(client.process(&XRDP_HANDSHAKE).unwrap()), work_area(1600, 900));
+
+    // No Execute Result ever arrives, so launches never pile up.
+    for _ in 0..100 {
+        assert_eq!(sent(client.queue_execute(launch("/usr/bin/xterm")).unwrap()).len(), 1);
+    }
+
+    let close = RailInputEvent::SystemCommand(SystemCommandPdu {
+        window_id: 0x0140_0007,
+        command: SystemCommand::Close,
+    });
+    assert_eq!(sent(client.queue_input(close).unwrap()), [RailPdu::from(close)]);
+
+    assert!(client.process(&[0x7F, 0x00, 0x04, 0x00]).unwrap().is_empty());
+    assert_eq!(sent(client.update_desktop_size(1280, 720)), work_area(1280, 720));
+
+    assert!(matches!(
+        client.take_events().as_slice(),
+        [
+            RailEvent::Handshake {
+                queued_execute_count: 1,
+                ..
+            },
+            RailEvent::PostHandshakeQueueReleased {
+                released_execute_count: 1
+            },
+            RailEvent::ServerReinitialized {
+                handshake_ex_flags: None
+            },
+            RailEvent::ProtocolWarning { .. },
+        ]
     ));
 }

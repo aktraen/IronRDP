@@ -4029,6 +4029,18 @@ async fn active_session(
                     process_image_name,
                 },
                 RailEvent::Control(control) => RdpOutputEvent::RailControl(control),
+                RailEvent::ServerReinitialized { handshake_ex_flags } => {
+                    debug!(?handshake_ex_flags, "RAIL server reinitialized");
+                    continue;
+                }
+                RailEvent::InitiationExhausted { attempts } => {
+                    warn!(attempts, "RAIL initiation got no server handshake");
+                    continue;
+                }
+                RailEvent::ProtocolWarning { description } => {
+                    warn!(%description, "Ignored RAIL protocol violation");
+                    continue;
+                }
             };
             if !send_active_output_event(output_event_sender, output_event, close_receiver).await? {
                 return Ok(RdpControlFlow::TerminatedGracefully(
