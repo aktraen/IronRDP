@@ -634,6 +634,20 @@ mod tests {
         assert_eq!(tracker.windows().count(), 2);
     }
 
+    /// xrdp does not cap the title it converts to UTF-16 (`rail_win_get_text` then libxrdp).
+    #[test]
+    fn xrdp_new_window_with_long_title_is_decodable() {
+        let forwarded = encode_forwarded_windowing_orders(&[app(9, &"x".repeat(300))]).unwrap();
+        let mut tracker = RailWindowTracker::new();
+
+        let events = tracker.apply_update(&forwarded);
+
+        let [RailWindowEvent::Created(window)] = events.as_slice() else {
+            panic!("window lost: {events:?}, decode_errors={}", tracker.decode_errors());
+        };
+        assert_eq!(window.title.len(), 260);
+    }
+
     struct Lcg(u64);
 
     impl Lcg {

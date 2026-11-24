@@ -203,7 +203,8 @@ fn validate_window_fields(flags: u32, src: &mut ReadCursor<'_>) -> DecodeResult<
             return Err(invalid_field_err!("ShowState", "invalid window show state"));
         }
     }
-    skip_unicode_if!(src, flags, 0x0000_0004, 520);
+    // [MS-RDPERP] caps TitleInfo at 520 bytes, but xrdp sends the X11 window name uncapped.
+    skip_unicode_if!(src, flags, 0x0000_0004, usize::from(u16::MAX));
     skip_if!(src, flags, 0x0000_4000, 8 /* ClientOffset */);
     skip_if!(src, flags, 0x0001_0000, 8 /* ClientAreaSize */);
     skip_if!(src, flags, 0x0000_0080, 8 /* HorizontalResizeMargins */);
@@ -456,6 +457,22 @@ const DESKTOP_ACTIVE_WINDOW: u32 = 0x0000_0020;
 /// `GRAPHICS_UPDATE_TYPE_ORDERS`, the first field of a forwarded Orders update.
 const UPDATE_TYPE_ORDERS: u16 = 0x0000;
 
+/// The longest title [MS-RDPERP] allows (520 bytes); [`decode_windowing_order`] truncates longer ones.
+pub const MAX_TITLE_CODE_UNITS: usize = 260;
+
+fn truncate_utf16(value: String, max_code_units: usize) -> String {
+    let mut code_units = 0;
+    for (index, character) in value.char_indices() {
+        code_units += character.len_utf16();
+        if code_units > max_code_units {
+            let mut truncated = value;
+            truncated.truncate(index);
+            return truncated;
+        }
+    }
+    value
+}
+
 /// Show state of a RemoteApp window ([MS-RDPERP] 2.2.1.3.1.2.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowShowState {
@@ -533,6 +550,7 @@ pub struct WindowInfoOrder {
     pub owner_window_id: Option<u32>,
     pub styles: Option<WindowStyles>,
     pub show_state: Option<WindowShowState>,
+    /// At most [`MAX_TITLE_CODE_UNITS`] UTF-16 code units: longer titles are truncated when decoding.
     pub title: Option<String>,
     pub client_offset: Option<WindowPoint>,
     pub client_area_size: Option<WindowExtent>,
@@ -828,7 +846,10 @@ fn decode_window_order(flags: u32, src: &mut ReadCursor<'_>) -> DecodeResult<Dec
         );
     }
     if flags & FIELD_TITLE != 0 {
-        order.title = Some(decode_unicode(src, 520)?);
+        order.title = Some(truncate_utf16(
+            decode_unicode(src, usize::from(u16::MAX))?,
+            MAX_TITLE_CODE_UNITS,
+        ));
     }
     if flags & FIELD_CLIENT_AREA_OFFSET != 0 {
         order.client_offset = Some(read_point(src)?);
@@ -1225,6 +1246,28 @@ mod tests {
             }
             assert!(decode_windowing_order(&mut ReadCursor::new(&order)).is_ok());
         }
+    }
+
+    #[test]
+    fn long_titles_are_accepted_and_truncated() {
+        let DecodedWindowingOrder::Window(mut window) = decode_one(&XRDP_NEW_WINDOW_ORDER) else {
+            panic!("expected a window order");
+        };
+        window.title = Some(format!("{}\u{1F600}tail", "x".repeat(MAX_TITLE_CODE_UNITS - 1)));
+        let forwarded = encode_forwarded_windowing_orders(&[DecodedWindowingOrder::Window(window)]).unwrap();
+
+        let validated = try_decode_slow_path_windowing_orders(&mut ReadCursor::new(&forwarded[2..])).unwrap();
+        assert_eq!(validated.orders.len(), 1);
+        let decoded = decode_forwarded_windowing_orders(&forwarded).unwrap();
+        let [DecodedWindowingOrder::Window(decoded)] = decoded.as_slice() else {
+            panic!("expected one window order");
+        };
+        assert_eq!(
+            decoded.title.as_deref().unwrap(),
+            "x".repeat(MAX_TITLE_CODE_UNITS - 1),
+            "a surrogate pair is never split"
+        );
+        assert_eq!(truncate_utf16("short".to_owned(), MAX_TITLE_CODE_UNITS), "short");
     }
 
     #[test]
