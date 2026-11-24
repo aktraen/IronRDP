@@ -8,6 +8,12 @@
  * Geometry belongs to the host: xrdp applies `railWindowMove()` but never reports a move or resize back,
  * nor one the application makes itself. The session applies each `railWindowMove()` to its own window
  * state and reports it as an `updated` event with `local: true`.
+ *
+ * Operations and the RAIL state: every `rail*` operation throws while the state is `exhausted` or
+ * `unavailable` (nothing is queued). While `initiating`, launches, activations and system commands wait
+ * until the server answers, at most 64 of them (the next one throws); a work area waits too (only the
+ * latest counts) and a resync is dropped. A `railWindowMove()` of a window the session does not know is
+ * ignored, and of queued moves of one window only the latest is sent.
  */
 
 import { Extension } from '../../../crates/ironrdp-web/pkg/ironrdp_web';
@@ -73,8 +79,10 @@ export type RailWindowEvent =
     | { kind: 'deleted'; id: number };
 
 /**
- * `exhausted`: the server never answered the initiation; `unavailable`: the server did not join the RAIL
- * channel (or it cannot be used). Neither ends the session; nothing is sent any more.
+ * `exhausted`: the server never answered the initiation, which is also what xrdp with its RAIL channel
+ * disabled produces (after 24 attempts 5 s apart by default); a late answer still establishes it.
+ * `unavailable`: the server did not join the RAIL channel (or it cannot be used); final.
+ * Neither ends the session, and `rail*` operations throw in both.
  */
 export type RailState = 'initiating' | 'established' | 'resyncing' | 'exhausted' | 'unavailable';
 
@@ -82,9 +90,11 @@ export interface RailStateEvent {
     state: RailState;
     /** Initiation attempts so far. */
     attempt: number;
-    /** The desktop size, which is also the work area sent to the server (the whole desktop). */
+    /** The size of the remote desktop. */
     desktopWidth: number;
     desktopHeight: number;
+    /** The work area sent to the server: the whole desktop unless set with `railSetWorkArea()`. */
+    workArea: RailRect;
     /** Why RAIL is `unavailable`, or a server protocol violation that was ignored. */
     warning?: string;
 }
@@ -226,7 +236,8 @@ export function railSysCommand(id: number, command: RailSysCommand): Extension {
 
 /**
  * Moves and resizes a window (at least 1x1; every edge must fit in a signed 16-bit coordinate). The server
- * never confirms it; the session reports it at once as an `updated` event with `local: true`.
+ * never confirms it; the session reports it at once as an `updated` event with `local: true`. A window the
+ * session does not know is ignored.
  */
 export function railWindowMove(id: number, rect: RailRect): Extension {
     const left = requireInteger('left', rect.left, I16_MIN, I16_MAX);
@@ -236,18 +247,23 @@ export function railWindowMove(id: number, rect: RailRect): Extension {
     return new Extension('rail_window_move', { id: windowId(id), left, top, width, height });
 }
 
-/** Sends a new work area (the session resize sends one itself after reactivation). */
-export function railSetWorkArea(width: number, height: number): Extension {
-    return new Extension('rail_set_work_area', {
-        width: requireInteger('width', width, 1, U16_MAX),
-        height: requireInteger('height', height, 1, U16_MAX),
-    });
+/**
+ * Sets the work area (where the server places and maximizes windows) and sends it alone, without a display
+ * change. A desktop resize resets it to the whole desktop.
+ */
+export function railSetWorkArea(rect: RailRect): Extension {
+    const left = requireInteger('left', rect.left, 0, U16_MAX - 1);
+    const top = requireInteger('top', rect.top, 0, U16_MAX - 1);
+    const width = requireInteger('width', rect.width, 1, U16_MAX - left);
+    const height = requireInteger('height', rect.height, 1, U16_MAX - top);
+    return new Extension('rail_set_work_area', { left, top, width, height });
 }
 
 /**
  * Sends the work area again so the server re-sends every window it still maps; after about 5 to 10 s, windows
  * it did not re-send (for example ones it unmapped) are deleted. A deleted window the server later updates
- * stays unknown until it is announced as new again.
+ * stays unknown until it is announced as new again. Popups (menus, tooltips) open during a launch are not
+ * re-sent by xrdp, so they may be deleted; xrdp announces them again the next time they open.
  */
 export function railResync(): Extension {
     return new Extension('rail_resync', true);

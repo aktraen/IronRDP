@@ -93,12 +93,14 @@ describe('RemoteApp extensions', () => {
     });
 
     it('work area, resync and state operations', () => {
-        expect(parts(rail.railSetWorkArea(1280, 720))).toEqual({
+        expect(parts(rail.railSetWorkArea({ left: 0, top: 40, width: 1280, height: 680 }))).toEqual({
             ident: 'rail_set_work_area',
-            value: { width: 1280, height: 720 },
+            value: { left: 0, top: 40, width: 1280, height: 680 },
         });
-        expect(() => rail.railSetWorkArea(0, 720)).toThrow(/width/);
-        expect(() => rail.railSetWorkArea(1280, 70000)).toThrow(/height/);
+        expect(() => rail.railSetWorkArea({ left: 0, top: 0, width: 0, height: 720 })).toThrow(/width/);
+        expect(() => rail.railSetWorkArea({ left: 0, top: 0, width: 1280, height: 70000 })).toThrow(/height/);
+        expect(() => rail.railSetWorkArea({ left: -1, top: 0, width: 1280, height: 720 })).toThrow(/left/);
+        expect(() => rail.railSetWorkArea({ left: 65000, top: 0, width: 1000, height: 720 })).toThrow(/width/);
         expect(parts(rail.railResync()).ident).toBe('rail_resync');
         expect(parts(rail.railState()).ident).toBe('rail_state');
     });
