@@ -22,6 +22,7 @@ mod image;
 mod input;
 mod network_client;
 mod printer;
+mod rail;
 mod rdp_file;
 mod session;
 

@@ -30,9 +30,14 @@ use ironrdp::rdpdr::Rdpdr;
 use ironrdp::rdpdr::pdu::efs::{DEFAULT_PRINTER_DRIVER_NAME, MICROSOFT_PRINT_TO_PDF_DRIVER_NAME};
 use ironrdp::rdpsnd::client::{NoopRdpsndBackend, Rdpsnd};
 use ironrdp::session::image::DecodedImage;
-use ironrdp::session::{ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason};
+use ironrdp::session::{
+    ActiveStage, ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason, WindowOrderErrorPolicy,
+};
 use ironrdp_core::WriteBuf;
 use ironrdp_futures::{FramedWrite, single_sequence_step_read};
+use ironrdp_pdu::PduResult;
+use ironrdp_rail::client::{RailClient, RailSvcMessages};
+use ironrdp_svc::SvcMessage;
 use rgb::AsPixels as _;
 use tap::prelude::*;
 use tracing::{debug, error, info, trace, warn};
@@ -49,7 +54,7 @@ use web_sys::HtmlCanvasElement;
 #[wasm_bindgen]
 extern "C" {
     #[wasm_bindgen(js_name = queueMicrotask)]
-    fn queue_microtask(cb: &js_sys::Function);
+    pub(crate) fn queue_microtask(cb: &js_sys::Function);
 }
 
 use crate::canvas::Canvas;
@@ -60,6 +65,8 @@ use crate::image::extract_partial_image;
 use crate::input::InputTransaction;
 use crate::network_client::WasmNetworkClient;
 use crate::printer::{JsPrinterStreamCallbacks, WasmPrinter, WasmPrinterBackend, wasm_printer_pair};
+use crate::rail::js::JsRailSink;
+use crate::rail::{DamageBatch, RailOp, RailShared, RemoteAppConfig, WebRail};
 
 const DEFAULT_WIDTH: u16 = 1280;
 const DEFAULT_HEIGHT: u16 = 720;
@@ -106,6 +113,13 @@ struct SessionBuilderInner {
     legacy_graphics: bool,
     outbound_message_size_limit: Option<usize>,
     canvas_resized_callback: Option<js_sys::Function>,
+
+    // RemoteApp (RAIL): set through extension(), off unless `remote_app` is given.
+    remote_app: Option<RemoteAppConfig>,
+    invalid_remote_app: Option<String>,
+    rail_window_callback: Option<js_sys::Function>,
+    rail_state_callback: Option<js_sys::Function>,
+    graphics_region_callback: Option<js_sys::Function>,
 }
 
 impl Default for SessionBuilderInner {
@@ -150,6 +164,12 @@ impl Default for SessionBuilderInner {
             legacy_graphics: false,
             outbound_message_size_limit: None,
             canvas_resized_callback: None,
+
+            remote_app: None,
+            invalid_remote_app: None,
+            rail_window_callback: None,
+            rail_state_callback: None,
+            graphics_region_callback: None,
         }
     }
 }
@@ -339,6 +359,29 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
                     Some(printer_driver_name)
                 };
             };
+            |remote_app: JsValue| {
+                let mut inner = self.0.borrow_mut();
+                match parse_remote_app(remote_app) {
+                    Ok(config) => {
+                        inner.remote_app = Some(config);
+                        inner.invalid_remote_app = None;
+                    }
+                    Err(error) => {
+                        warn!(%error, "Invalid remote_app");
+                        inner.remote_app = None;
+                        inner.invalid_remote_app = Some(format!("{error:#}"));
+                    }
+                }
+            };
+            |rail_window_callback: JsValue| {
+                self.0.borrow_mut().rail_window_callback = rail_window_callback.dyn_into::<js_sys::Function>().ok();
+            };
+            |rail_state_callback: JsValue| {
+                self.0.borrow_mut().rail_state_callback = rail_state_callback.dyn_into::<js_sys::Function>().ok();
+            };
+            |graphics_region_callback: JsValue| {
+                self.0.borrow_mut().graphics_region_callback = graphics_region_callback.dyn_into::<js_sys::Function>().ok();
+            };
         }
 
         self.clone()
@@ -427,6 +470,19 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             return Err(anyhow::Error::msg("generic preconnection blob and VMConnect are mutually exclusive").into());
         }
 
+        let (remote_app, rail_window_callback, rail_state_callback, graphics_region_callback) = {
+            let inner = self.0.borrow();
+            if let Some(error) = &inner.invalid_remote_app {
+                return Err(IronError::from(anyhow::anyhow!("invalid remote_app: {error}")));
+            }
+            (
+                inner.remote_app.clone(),
+                inner.rail_window_callback.clone(),
+                inner.rail_state_callback.clone(),
+                inner.graphics_region_callback.clone(),
+            )
+        };
+
         info!("Connect to RDP host");
 
         let mut config = build_config(
@@ -436,7 +492,11 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             client_name.clone(),
             desktop_size,
             legacy_graphics,
+            remote_app.as_ref(),
         );
+        let rail_client = remote_app
+            .as_ref()
+            .map(|app| app.rail_client(desktop_size.width, desktop_size.height));
 
         let enable_credssp = self.0.borrow().enable_credssp;
         config.enable_credssp = enable_credssp;
@@ -527,6 +587,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             printer_driver_name,
             computer_name: client_name.clone(),
             use_display_control,
+            rail_client,
         })
         .await?;
 
@@ -537,6 +598,18 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
         let (writer_tx, writer_rx) = mpsc::unbounded();
 
         spawn_local(writer_task(writer_rx, rdp_writer, outbound_message_size_limit));
+
+        let rail_shared = remote_app
+            .as_ref()
+            .map(|_| Rc::new(RefCell::new(RailShared::default())));
+        let rail = remote_app.zip(rail_shared.clone()).map(|(config, shared)| RailParts {
+            config,
+            sink: JsRailSink {
+                window_callback: rail_window_callback,
+                state_callback: rail_state_callback,
+            },
+            shared,
+        });
 
         Ok(Session {
             desktop_size: connection_result.desktop_size,
@@ -555,6 +628,9 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             printer: RefCell::new(Some(printer)),
             display_control_ready: Cell::new(false),
             canvas_resized_callback,
+            rail: RefCell::new(rail),
+            rail_shared,
+            graphics_region_callback,
         })
     }
 }
@@ -575,6 +651,8 @@ pub(crate) enum RdpInputEvent {
         scale_factor: Option<u32>,
         physical_size: Option<(u32, u32)>,
     },
+    /// A RemoteApp operation from `invoke_extension`.
+    Rail(RailOp),
     TerminateSession,
 }
 
@@ -607,9 +685,31 @@ pub(crate) struct Session {
 
     display_control_ready: Cell<bool>,
     canvas_resized_callback: Option<js_sys::Function>,
+
+    // RemoteApp: `rail` is consumed when `run` is called; `rail_shared` stays readable by `rail_state`.
+    rail: RefCell<Option<RailParts>>,
+    rail_shared: Option<Rc<RefCell<RailShared>>>,
+    graphics_region_callback: Option<js_sys::Function>,
+}
+
+struct RailParts {
+    config: RemoteAppConfig,
+    sink: JsRailSink,
+    shared: Rc<RefCell<RailShared>>,
 }
 
 impl Session {
+    fn send_rail_op(&self, op: Result<RailOp, String>) -> Result<JsValue, IronError> {
+        if self.rail_shared.is_none() {
+            return Err(remote_app_off());
+        }
+        let op = op.map_err(|error| IronError::from(anyhow::Error::msg(error)))?;
+        self.input_events_tx
+            .unbounded_send(RdpInputEvent::Rail(op))
+            .context("send RAIL operation")?;
+        Ok(JsValue::NULL)
+    }
+
     fn h_send_inputs(&self, inputs: smallvec::SmallVec<[FastPathInputEvent; 2]>) -> Result<(), IronError> {
         if !inputs.is_empty() {
             trace!("Inputs: {inputs:?}");
@@ -722,6 +822,29 @@ impl iron_remote_desktop::Session for Session {
             pointer_software_rendering: connection_result.pointer_software_rendering,
         }
         .build();
+
+        let mut damage = self.graphics_region_callback.as_ref().map(|_| DamageBatch::default());
+        let mut web_rail = match self.rail.borrow_mut().take() {
+            Some(RailParts { config, sink, shared }) => {
+                // RemoteApp only: forward window orders, and never let a malformed one end the session.
+                active_stage.set_window_support_level(connection_result.window_support_level);
+                active_stage.set_window_order_error_policy(WindowOrderErrorPolicy::Skip);
+                let mut rail = WebRail::new(
+                    config,
+                    sink,
+                    shared,
+                    connection_result.desktop_size.width,
+                    connection_result.desktop_size.height,
+                );
+                if let Some(frame) = rail_frame(&mut active_stage, |client| rail.start(client))? {
+                    self.writer_tx
+                        .unbounded_send(frame)
+                        .context("Send frame to writer task")?;
+                }
+                Some(rail)
+            }
+            None => None,
+        };
 
         // Timer interval for driving clipboard lock timeouts (5 second interval)
         let mut cleanup_interval = IntervalStream::new(5_000).fuse();
@@ -905,6 +1028,15 @@ impl iron_remote_desktop::Session for Session {
                             }
                             Vec::new()
                         }
+                        RdpInputEvent::Rail(op) => match web_rail.as_mut() {
+                            Some(rail) => rail_frame(&mut active_stage, |client| rail.on_op(client, op))?
+                                .map(|frame| vec![ActiveStageOutput::ResponseFrame(frame)])
+                                .unwrap_or_default(),
+                            None => {
+                                warn!("RAIL operation received, but RemoteApp is off");
+                                Vec::new()
+                            }
+                        },
                         RdpInputEvent::TerminateSession => {
                             active_stage.graceful_shutdown()
                                 .context("graceful shutdown")?
@@ -912,8 +1044,15 @@ impl iron_remote_desktop::Session for Session {
                     }
                 }
                 _ = cleanup_interval.next() => {
+                    let mut tick_outputs = Vec::new();
+                    // Resend the RAIL initiation until xrdp answers, and end window resyncs.
+                    if let Some(rail) = web_rail.as_mut()
+                        && let Some(frame) = rail_frame(&mut active_stage, |client| rail.on_tick(client))?
+                    {
+                        tick_outputs.push(ActiveStageOutput::ResponseFrame(frame));
+                    }
                     // Drive clipboard lock timeout cleanup
-                    if let Some(cliprdr) = active_stage.get_svc_processor_mut::<CliprdrClient>() {
+                    tick_outputs.extend(if let Some(cliprdr) = active_stage.get_svc_processor_mut::<CliprdrClient>() {
                         match cliprdr.drive_timeouts() {
                             Ok(svc_messages) => {
                                 let frame = active_stage.process_svc_processor_messages(svc_messages)?;
@@ -930,7 +1069,8 @@ impl iron_remote_desktop::Session for Session {
                         }
                     } else {
                         Vec::new()
-                    }
+                    });
+                    tick_outputs
                 }
             };
 
@@ -942,6 +1082,10 @@ impl iron_remote_desktop::Session for Session {
                             .context("Send frame to writer task")?;
                     }
                     ActiveStageOutput::GraphicsUpdate(region) => {
+                        // Before extraction, which may widen the region to whole rows.
+                        if let Some(damage) = damage.as_mut() {
+                            damage.push(&region);
+                        }
                         let region = extract_partial_image(&image, region, &mut draw_buffer);
                         gui.draw(draw_buffer.filled_mut(), region)
                             .context("draw updated region")?;
@@ -1053,8 +1197,11 @@ impl iron_remote_desktop::Session for Session {
                             "Received remote monitor layout without multi-monitor support"
                         );
                     }
-                    ActiveStageOutput::WindowingOrders(_) => {
-                        // Windowing orders are not meaningful to the protocol-agnostic web component.
+                    ActiveStageOutput::WindowingOrders(orders) => {
+                        // Only RemoteApp sessions track windows; the component itself draws the desktop.
+                        if let Some(rail) = web_rail.as_mut() {
+                            rail.on_windowing_orders(&orders);
+                        }
                     }
                     ActiveStageOutput::DeactivateAll => {
                         // Execute the Deactivation-Reactivation Sequence:
@@ -1113,6 +1260,16 @@ impl iron_remote_desktop::Session for Session {
                                     return Err(IronError::from(anyhow::anyhow!("invalid static channel chunk size")));
                                 }
                                 active_stage.set_window_support_level(window_support_level);
+                                // xrdp re-announces its windows for the new work area.
+                                if let Some(rail) = web_rail.as_mut()
+                                    && let Some(frame) = rail_frame(&mut active_stage, |client| {
+                                        Ok(rail.on_desktop_resized(client, desktop_size.width, desktop_size.height))
+                                    })?
+                                {
+                                    self.writer_tx
+                                        .unbounded_send(frame)
+                                        .context("Send frame to writer task")?;
+                                }
                                 break 'activation_seq;
                             }
                         }
@@ -1140,6 +1297,18 @@ impl iron_remote_desktop::Session for Session {
                         debug!("RDP session info notification");
                     }
                     ActiveStageOutput::Terminate(reason) => break 'outer reason,
+                }
+            }
+
+            if let Some(rail) = web_rail.as_mut()
+                && let Some(client) = active_stage.get_svc_processor_mut::<RailClient>()
+            {
+                rail.drain_channel_events(client);
+            }
+            if let (Some(batch), Some(callback)) = (damage.as_mut(), self.graphics_region_callback.as_ref()) {
+                let regions = batch.take();
+                if !regions.is_empty() {
+                    crate::rail::js::defer_call(callback, crate::rail::js::regions(&regions));
                 }
             }
         };
@@ -1244,6 +1413,53 @@ impl iron_remote_desktop::Session for Session {
             |display_control_ready: JsValue| {
                 let _ = display_control_ready;
                 return Ok(JsValue::from_bool(self.display_control_ready.get()));
+            };
+            |rail_execute: JsValue| {
+                let obj = into_object(rail_execute)?;
+                let op = RailOp::execute(
+                    get_string(&obj, "exe")?,
+                    get_string_opt(&obj, "work_dir")?.unwrap_or_default(),
+                    get_string_opt(&obj, "args")?.unwrap_or_default(),
+                );
+                return self.send_rail_op(op);
+            };
+            |rail_activate: JsValue| {
+                let obj = into_object(rail_activate)?;
+                let op = RailOp::Activate {
+                    window_id: get_u32(&obj, "id")?,
+                    enabled: get_bool_opt(&obj, "enabled")?.unwrap_or(true),
+                };
+                return self.send_rail_op(Ok(op));
+            };
+            |rail_sys_command: JsValue| {
+                let obj = into_object(rail_sys_command)?;
+                let op = RailOp::sys_command(get_u32(&obj, "id")?, &get_string(&obj, "command")?);
+                return self.send_rail_op(op);
+            };
+            |rail_window_move: JsValue| {
+                let obj = into_object(rail_window_move)?;
+                let op = RailOp::window_move(
+                    get_u32(&obj, "id")?,
+                    get_i32(&obj, "left")?,
+                    get_i32(&obj, "top")?,
+                    get_u32(&obj, "width")?,
+                    get_u32(&obj, "height")?,
+                );
+                return self.send_rail_op(op);
+            };
+            |rail_set_work_area: JsValue| {
+                let obj = into_object(rail_set_work_area)?;
+                let op = RailOp::set_work_area(get_u32(&obj, "width")?, get_u32(&obj, "height")?);
+                return self.send_rail_op(op);
+            };
+            |rail_resync: JsValue| {
+                let _ = rail_resync;
+                return self.send_rail_op(Ok(RailOp::Resync));
+            };
+            |rail_state: JsValue| {
+                let _ = rail_state;
+                let shared = self.rail_shared.as_ref().ok_or_else(remote_app_off)?;
+                return Ok(crate::rail::js::shared(&shared.borrow()));
             };
             |request_file_contents: JsValue| {
                 let obj = into_object(request_file_contents)?;
@@ -1359,6 +1575,88 @@ fn get_bool(obj: &js_sys::Object, key: &str) -> Result<bool, IronError> {
     val.as_bool()
         .with_context(|| format!("invalid type for property `{key}`"))
         .map_err(Into::into)
+}
+
+fn get_optional_value(obj: &js_sys::Object, key: &str) -> Result<Option<JsValue>, IronError> {
+    let val = js_sys::Reflect::get(obj, &JsValue::from_str(key))
+        .map_err(|e| anyhow::anyhow!("get property `{key}`: {e:?}"))?;
+    Ok((!val.is_undefined() && !val.is_null()).then_some(val))
+}
+
+fn get_string_opt(obj: &js_sys::Object, key: &str) -> Result<Option<String>, IronError> {
+    get_optional_value(obj, key)?
+        .map(|val| {
+            val.as_string()
+                .with_context(|| format!("invalid type for property `{key}`"))
+                .map_err(Into::into)
+        })
+        .transpose()
+}
+
+fn get_string(obj: &js_sys::Object, key: &str) -> Result<String, IronError> {
+    get_string_opt(obj, key)?
+        .with_context(|| format!("missing property `{key}`"))
+        .map_err(Into::into)
+}
+
+fn get_bool_opt(obj: &js_sys::Object, key: &str) -> Result<Option<bool>, IronError> {
+    get_optional_value(obj, key)?
+        .map(|val| {
+            val.as_bool()
+                .with_context(|| format!("invalid type for property `{key}`"))
+                .map_err(Into::into)
+        })
+        .transpose()
+}
+
+fn remote_app_off() -> IronError {
+    IronError::from(anyhow::Error::msg("RemoteApp is not enabled for this session"))
+}
+
+/// Parses the `remote_app` extension value:
+/// `{ alternate_shell: string, work_dir?: string, bootstrap_executable?: string, max_init_attempts?: number }`.
+fn parse_remote_app(value: JsValue) -> anyhow::Result<RemoteAppConfig> {
+    let obj = value
+        .dyn_into::<js_sys::Object>()
+        .map_err(|_| anyhow::anyhow!("expected object"))?;
+    let error = |error: IronError| anyhow::anyhow!("{}", iron_remote_desktop::IronError::backtrace(&error));
+    let mut config = RemoteAppConfig::new(get_string(&obj, "alternate_shell").map_err(error)?);
+    if let Some(work_dir) = get_string_opt(&obj, "work_dir").map_err(error)? {
+        config.work_dir = work_dir;
+    }
+    if let Some(bootstrap) = get_string_opt(&obj, "bootstrap_executable").map_err(error)? {
+        anyhow::ensure!(!bootstrap.is_empty(), "bootstrap_executable must not be empty");
+        config.bootstrap_executable = bootstrap;
+    }
+    if let Some(attempts) = get_u32_opt(&obj, "max_init_attempts").map_err(error)? {
+        anyhow::ensure!(attempts > 0, "max_init_attempts must be positive");
+        config.max_init_attempts = attempts;
+    }
+    Ok(config)
+}
+
+/// Runs a RAIL operation on the session's RAIL channel and encodes what it sends.
+///
+/// A RAIL error is logged and dropped: a pop-out window must never end the session.
+fn rail_frame(
+    active_stage: &mut ActiveStage,
+    operation: impl FnOnce(&mut RailClient) -> PduResult<RailSvcMessages>,
+) -> Result<Option<Vec<u8>>, IronError> {
+    let Some(client) = active_stage.get_svc_processor_mut::<RailClient>() else {
+        return Ok(None);
+    };
+    let messages: Vec<SvcMessage> = match operation(client) {
+        Ok(messages) => messages.into(),
+        Err(error) => {
+            warn!(%error, "RAIL operation failed");
+            return Ok(None);
+        }
+    };
+    if messages.is_empty() {
+        return Ok(None);
+    }
+    let frame = active_stage.process_svc_processor_messages(RailSvcMessages::from(messages))?;
+    Ok(Some(frame))
 }
 
 fn get_u32_opt(obj: &js_sys::Object, key: &str) -> Result<Option<u32>, IronError> {
@@ -1491,6 +1789,7 @@ fn build_config(
     client_name: String,
     desktop_size: DesktopSize,
     legacy_graphics: bool,
+    remote_app: Option<&RemoteAppConfig>,
 ) -> connector::Config {
     // Win7-class servers need 32-bpp lossless bitmaps and no advertised codecs.
     let bitmap = if legacy_graphics {
@@ -1564,11 +1863,12 @@ fn build_config(
         hardware_id: None,
         license_cache: None,
         timezone_info: TimezoneInfo::default(),
-        alternate_shell: String::new(),
-        work_dir: String::new(),
-        remote_application_mode: false,
+        // RemoteApp sessions name their xrdp session through the alternate shell.
+        alternate_shell: remote_app.map(|app| app.alternate_shell.clone()).unwrap_or_default(),
+        work_dir: remote_app.map(|app| app.work_dir.clone()).unwrap_or_default(),
+        remote_application_mode: remote_app.is_some(),
         rail_support_level: ironrdp::pdu::rdp::capability_sets::RailSupportLevel::SUPPORTED,
-        remote_application_send_alternate_shell: false,
+        remote_application_send_alternate_shell: remote_app.is_some(),
     }
 }
 
@@ -1627,6 +1927,8 @@ struct ConnectParams {
     /// `computer_name` when constructing the `Rdpdr` processor.
     computer_name: String,
     use_display_control: bool,
+    /// Attached for RemoteApp sessions only.
+    rail_client: Option<RailClient>,
 }
 
 fn default_printer_driver_name() -> String {
@@ -1677,6 +1979,7 @@ async fn connect(
         printer_driver_name,
         computer_name,
         use_display_control,
+        rail_client,
     }: ConnectParams,
 ) -> Result<(connector::ConnectionResult, WebSocket), IronError> {
     let mut framed = ironrdp_futures::LocalFuturesFramed::new(ws);
@@ -1702,6 +2005,10 @@ async fn connect(
                 printer_driver_name,
             ),
         );
+    }
+
+    if let Some(rail_client) = rail_client {
+        connector.attach_static_channel(rail_client);
     }
 
     if use_display_control {

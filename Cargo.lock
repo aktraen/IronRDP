@@ -3557,6 +3557,7 @@ dependencies = [
  "ironrdp-futures",
  "ironrdp-pdu",
  "ironrdp-propertyset",
+ "ironrdp-rail",
  "ironrdp-rdcleanpath",
  "ironrdp-rdpfile",
  "ironrdp-svc",
