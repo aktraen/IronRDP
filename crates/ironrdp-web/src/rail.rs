@@ -520,6 +520,7 @@ pub(crate) mod js {
                 window: updated,
                 changes,
                 reannounced,
+                local,
             } => {
                 set(&object, "kind", &JsValue::from_str("updated"));
                 set(&object, "id", &number(updated.id));
@@ -530,6 +531,7 @@ pub(crate) mod js {
                     .collect::<Array>();
                 set(&object, "changed", &changed.into());
                 set(&object, "reannounced", &JsValue::from_bool(*reannounced));
+                set(&object, "local", &JsValue::from_bool(*local));
             }
             RailWindowEvent::Deleted { id } => {
                 set(&object, "kind", &JsValue::from_str("deleted"));

@@ -11,6 +11,8 @@ const WS_POPUP: u32 = 0x8000_0000;
 const WS_CAPTION: u32 = 0x00C0_0000;
 const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
 const WS_EX_APPWINDOW: u32 = 0x0004_0000;
+/// Most windows tracked at once; announcements beyond it are ignored and counted.
+const MAX_WINDOWS: usize = 512;
 
 /// How a host should present a RemoteApp window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,7 +38,8 @@ pub struct RailRect {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RailWindow {
     pub id: u32,
-    /// The owning window, when it is not the root window.
+    /// The owning window, when it is not the root window. It may name a window that is not (or no
+    /// longer) tracked; such a window keeps its owned role.
     pub owner: Option<u32>,
     pub style: u32,
     pub extended_style: u32,
@@ -76,10 +79,13 @@ pub enum RailWindowEvent {
     Created(RailWindow),
     /// `reannounced` is set when the server sent the window again as new, which xrdp does for
     /// every mapped window after each Execute (a work area alone re-sends them as plain updates).
+    /// `local` is set when the change comes from [`RailWindowTracker::apply_local_move`], not
+    /// from the server.
     Updated {
         window: RailWindow,
         changes: RailWindowChanges,
         reannounced: bool,
+        local: bool,
     },
     Deleted {
         id: u32,
@@ -302,7 +308,48 @@ impl RailWindowTracker {
         self.resync_seen = None;
     }
 
-    /// Returns how many forwarded updates could not be decoded.
+    /// Records a window move the client sent, since the server may never echo it.
+    ///
+    /// xrdp 0.10 applies a Client Window Move but never reports geometry back (its configure
+    /// orders are disabled), so the host owns the geometry of the windows it moves.
+    pub fn apply_local_move(&mut self, id: u32, rect: RailRect) -> Option<RailWindowEvent> {
+        let tracked = self.windows.get_mut(&id)?;
+        let size = WindowExtent {
+            width: rect.width,
+            height: rect.height,
+        };
+        let full = vec![WindowRectangle {
+            left: 0,
+            top: 0,
+            right: u16::try_from(rect.width).unwrap_or(u16::MAX),
+            bottom: u16::try_from(rect.height).unwrap_or(u16::MAX),
+        }];
+        let offset = WindowPoint {
+            x: rect.left,
+            y: rect.top,
+        };
+        let raw = &mut tracked.raw;
+        raw.window_offset = offset;
+        raw.window_size = size;
+        raw.visible_offset = offset;
+        raw.window_rects = full.clone();
+        raw.visibility_rects = full;
+        if raw.client_area_size.is_some() {
+            raw.client_area_size = Some(size);
+        }
+        let window = raw.snapshot(id);
+        let changes = changes(&tracked.snapshot, &window);
+        tracked.snapshot = window.clone();
+        changes.any().then_some(RailWindowEvent::Updated {
+            window,
+            changes,
+            reannounced: false,
+            local: true,
+        })
+    }
+
+    /// Returns how many forwarded updates could not be decoded, plus window announcements ignored
+    /// beyond the 512-window cap.
     pub fn decode_errors(&self) -> u64 {
         self.decode_errors
     }
@@ -313,6 +360,7 @@ impl RailWindowTracker {
         if let Some(seen) = self.resync_seen.as_mut() {
             seen.insert(id);
         }
+        let full = self.windows.len() >= MAX_WINDOWS;
         match self.windows.get_mut(&id) {
             Some(tracked) => {
                 tracked.raw.merge(info);
@@ -323,7 +371,12 @@ impl RailWindowTracker {
                     window,
                     changes,
                     reannounced: is_new,
+                    local: false,
                 })
+            }
+            None if is_new && full => {
+                self.decode_errors = self.decode_errors.saturating_add(1);
+                None
             }
             None if is_new => {
                 let mut raw = RawWindow::default();
@@ -461,6 +514,7 @@ mod tests {
             window,
             changes,
             reannounced: false,
+            local: false,
         }) = event
         else {
             panic!("expected an update, got {event:?}");
@@ -585,6 +639,7 @@ mod tests {
                 window: tracker.window(7).unwrap().clone(),
                 changes: RailWindowChanges::default(),
                 reannounced: true,
+                local: false,
             })
         );
         assert_eq!(tracker.windows().count(), 1);
@@ -646,6 +701,54 @@ mod tests {
             panic!("window lost: {events:?}, decode_errors={}", tracker.decode_errors());
         };
         assert_eq!(window.title.len(), 260);
+    }
+
+    #[test]
+    fn local_move_updates_the_window_the_server_never_echoes() {
+        let mut tracker = RailWindowTracker::new();
+        tracker.apply(app(7, "Wireshark"));
+        let rect = RailRect {
+            left: 100,
+            top: 50,
+            width: 800,
+            height: 600,
+        };
+
+        let Some(RailWindowEvent::Updated {
+            window,
+            changes,
+            local: true,
+            reannounced: false,
+        }) = tracker.apply_local_move(7, rect)
+        else {
+            panic!("expected a local update");
+        };
+        assert_eq!(window.window_rect, rect);
+        assert_eq!(window.visibility_rects, [rect]);
+        assert!(changes.geometry && changes.visibility);
+        assert_eq!(tracker.window(7).unwrap().window_rect, rect);
+        assert_eq!(tracker.apply_local_move(7, rect), None);
+        assert_eq!(tracker.apply_local_move(8, rect), None);
+    }
+
+    #[test]
+    fn window_count_is_capped() {
+        let mut tracker = RailWindowTracker::new();
+        for id in 0..600 {
+            tracker.apply(app(id, "w"));
+        }
+
+        assert_eq!(tracker.windows().count(), 512);
+        assert_eq!(tracker.decode_errors(), 88);
+        assert!(matches!(
+            tracker.apply(app(3, "w")),
+            Some(RailWindowEvent::Updated { .. })
+        ));
+        tracker.apply(DecodedWindowingOrder::WindowDeleted { window_id: 3 });
+        assert!(matches!(
+            tracker.apply(app(599, "w")),
+            Some(RailWindowEvent::Created(_))
+        ));
     }
 
     struct Lcg(u64);

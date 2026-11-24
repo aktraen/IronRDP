@@ -390,8 +390,9 @@ fn print_window_event(started: Instant, event: &RailWindowEvent) {
             window,
             changes,
             reannounced,
+            local,
         } => println!(
-            "[{elapsed:>6}] updated {} {changes:?} reannounced={reannounced}",
+            "[{elapsed:>6}] updated {} {changes:?} reannounced={reannounced} local={local}",
             describe(window)
         ),
         RailWindowEvent::Deleted { id } => println!("[{elapsed:>6}] deleted {id:#x}"),

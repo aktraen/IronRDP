@@ -1175,8 +1175,10 @@ mod tests {
         );
     }
 
+    /// A geometry-only update; xrdp 0.10 never sends one (its configure path is disabled), other
+    /// servers do.
     #[test]
-    fn decodes_xrdp_configure_window_order() {
+    fn decodes_window_geometry_update_order() {
         let minus_eight = u32::from_le_bytes((-8i32).to_le_bytes());
         let mut fields = le(&[0x0140_0007, 0, 0, 640, 480, 0x221, minus_eight, 30, 0, 0, 640, 480]);
         fields.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0x80, 0x02, 0xe0, 0x01]);
