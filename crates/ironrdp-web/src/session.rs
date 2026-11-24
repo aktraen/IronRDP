@@ -811,6 +811,10 @@ impl iron_remote_desktop::Session for Session {
         // We retain the factory to drive the Deactivation-Reactivation Sequence locally.
         let activation_factory = connection_result.activation_factory;
 
+        let rail_joined = connection_result
+            .static_channels
+            .get_channel_id_by_type::<RailClient>()
+            .is_some();
         let mut active_stage = ActiveStageBuilder {
             static_channels: connection_result.static_channels,
             user_channel_id: connection_result.user_channel_id,
@@ -836,7 +840,10 @@ impl iron_remote_desktop::Session for Session {
                     connection_result.desktop_size.width,
                     connection_result.desktop_size.height,
                 );
-                if let Some(frame) = rail_frame(&mut active_stage, |client| rail.start(client))? {
+                if !rail_joined {
+                    rail.mark_unavailable("the server did not join the RAIL channel".to_owned());
+                } else if let Some(frame) = rail_frame(&mut active_stage, &mut rail, |rail, client| rail.start(client))
+                {
                     self.writer_tx
                         .unbounded_send(frame)
                         .context("Send frame to writer task")?;
@@ -1029,7 +1036,7 @@ impl iron_remote_desktop::Session for Session {
                             Vec::new()
                         }
                         RdpInputEvent::Rail(op) => match web_rail.as_mut() {
-                            Some(rail) => rail_frame(&mut active_stage, |client| rail.on_op(client, op))?
+                            Some(rail) => rail_frame(&mut active_stage, rail, |rail, client| rail.on_op(client, op))
                                 .map(|frame| vec![ActiveStageOutput::ResponseFrame(frame)])
                                 .unwrap_or_default(),
                             None => {
@@ -1047,7 +1054,7 @@ impl iron_remote_desktop::Session for Session {
                     let mut tick_outputs = Vec::new();
                     // Resend the RAIL initiation until xrdp answers, and end window resyncs.
                     if let Some(rail) = web_rail.as_mut()
-                        && let Some(frame) = rail_frame(&mut active_stage, |client| rail.on_tick(client))?
+                        && let Some(frame) = rail_frame(&mut active_stage, rail, |rail, client| rail.on_tick(client))
                     {
                         tick_outputs.push(ActiveStageOutput::ResponseFrame(frame));
                     }
@@ -1262,9 +1269,9 @@ impl iron_remote_desktop::Session for Session {
                                 active_stage.set_window_support_level(window_support_level);
                                 // xrdp re-announces its windows for the new work area.
                                 if let Some(rail) = web_rail.as_mut()
-                                    && let Some(frame) = rail_frame(&mut active_stage, |client| {
+                                    && let Some(frame) = rail_frame(&mut active_stage, rail, |rail, client| {
                                         Ok(rail.on_desktop_resized(client, desktop_size.width, desktop_size.height))
-                                    })?
+                                    })
                                 {
                                     self.writer_tx
                                         .unbounded_send(frame)
@@ -1637,26 +1644,31 @@ fn parse_remote_app(value: JsValue) -> anyhow::Result<RemoteAppConfig> {
 
 /// Runs a RAIL operation on the session's RAIL channel and encodes what it sends.
 ///
-/// A RAIL error is logged and dropped: a pop-out window must never end the session.
+/// A RAIL error never ends the session: an operation error is logged and dropped, and a channel
+/// that cannot carry the messages makes RAIL unavailable.
 fn rail_frame(
     active_stage: &mut ActiveStage,
-    operation: impl FnOnce(&mut RailClient) -> PduResult<RailSvcMessages>,
-) -> Result<Option<Vec<u8>>, IronError> {
-    let Some(client) = active_stage.get_svc_processor_mut::<RailClient>() else {
-        return Ok(None);
-    };
-    let messages: Vec<SvcMessage> = match operation(client) {
+    rail: &mut WebRail<JsRailSink>,
+    operation: impl FnOnce(&mut WebRail<JsRailSink>, &mut RailClient) -> PduResult<RailSvcMessages>,
+) -> Option<Vec<u8>> {
+    let client = active_stage.get_svc_processor_mut::<RailClient>()?;
+    let messages: Vec<SvcMessage> = match operation(rail, client) {
         Ok(messages) => messages.into(),
         Err(error) => {
             warn!(%error, "RAIL operation failed");
-            return Ok(None);
+            return None;
         }
     };
     if messages.is_empty() {
-        return Ok(None);
+        return None;
     }
-    let frame = active_stage.process_svc_processor_messages(RailSvcMessages::from(messages))?;
-    Ok(Some(frame))
+    match active_stage.process_svc_processor_messages(RailSvcMessages::from(messages)) {
+        Ok(frame) => Some(frame),
+        Err(error) => {
+            rail.mark_unavailable(format!("the RAIL channel cannot be used: {error}"));
+            None
+        }
+    }
 }
 
 fn get_u32_opt(obj: &js_sys::Object, key: &str) -> Result<Option<u32>, IronError> {

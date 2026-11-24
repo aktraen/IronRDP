@@ -78,6 +78,8 @@ pub(crate) enum RailPhase {
     Resyncing,
     /// No Handshake after the configured number of attempts.
     Exhausted,
+    /// The RAIL channel cannot be used (the server did not join it); nothing is sent any more.
+    Unavailable,
 }
 
 impl RailPhase {
@@ -87,6 +89,7 @@ impl RailPhase {
             Self::Established => "established",
             Self::Resyncing => "resyncing",
             Self::Exhausted => "exhausted",
+            Self::Unavailable => "unavailable",
         }
     }
 }
@@ -96,6 +99,7 @@ impl RailPhase {
 pub(crate) struct RailStateSnapshot {
     pub(crate) phase: RailPhase,
     pub(crate) attempt: u32,
+    /// The desktop size, which is also the work area sent to the server (the whole desktop).
     pub(crate) desktop_width: u16,
     pub(crate) desktop_height: u16,
     pub(crate) warning: Option<String>,
@@ -141,8 +145,11 @@ impl RailOp {
         Ok(Self::SysCommand { window_id, command })
     }
 
-    /// A window move to `left, top` with the given size, in desktop coordinates.
+    /// A window move to `left, top` with the given size (at least 1x1), in desktop coordinates.
     pub(crate) fn window_move(window_id: u32, left: i32, top: i32, width: u32, height: u32) -> Result<Self, String> {
+        if width == 0 || height == 0 {
+            return Err(format!("RAIL window move to an empty size for window {window_id:#x}"));
+        }
         let coordinate = |value: i64| {
             i16::try_from(value).map_err(|_| format!("RAIL window move out of range for window {window_id:#x}"))
         };
@@ -301,7 +308,7 @@ impl<S: RailSink> WebRail<S> {
                 }
                 Ok(Vec::new().into())
             }
-            RailPhase::Established | RailPhase::Exhausted => Ok(Vec::new().into()),
+            RailPhase::Established | RailPhase::Exhausted | RailPhase::Unavailable => Ok(Vec::new().into()),
         }
     }
 
@@ -345,6 +352,9 @@ impl<S: RailSink> WebRail<S> {
     }
 
     pub(crate) fn on_op(&mut self, client: &mut RailClient, op: RailOp) -> PduResult<RailSvcMessages> {
+        if self.phase == RailPhase::Unavailable {
+            return Ok(Vec::new().into());
+        }
         match op {
             RailOp::Execute(execute) => client.queue_execute(execute),
             RailOp::Activate { window_id, enabled } => {
@@ -353,7 +363,21 @@ impl<S: RailSink> WebRail<S> {
             RailOp::SysCommand { window_id, command } => {
                 client.queue_input(RailInputEvent::SystemCommand(SystemCommandPdu { window_id, command }))
             }
-            RailOp::WindowMove(window_move) => client.queue_input(RailInputEvent::WindowMove(window_move)),
+            RailOp::WindowMove(window_move) => {
+                let messages = client.queue_input(RailInputEvent::WindowMove(window_move))?;
+                // xrdp never reports geometry back, so the tracker follows the host's moves.
+                let rectangle = window_move.rectangle;
+                let rect = RailRect {
+                    left: i32::from(rectangle.left),
+                    top: i32::from(rectangle.top),
+                    width: u32::try_from(i32::from(rectangle.right) - i32::from(rectangle.left)).unwrap_or(0),
+                    height: u32::try_from(i32::from(rectangle.bottom) - i32::from(rectangle.top)).unwrap_or(0),
+                };
+                if let Some(event) = self.tracker.apply_local_move(window_move.window_id, rect) {
+                    self.publish_windows(&[event]);
+                }
+                Ok(messages)
+            }
             RailOp::SetWorkArea { width, height } => Ok(self.on_desktop_resized(client, width, height)),
             RailOp::Resync => {
                 if !client.is_established() {
@@ -371,6 +395,16 @@ impl<S: RailSink> WebRail<S> {
         self.desktop_height = height;
         self.publish_state(None);
         client.update_desktop_size(width, height)
+    }
+
+    /// Stops using the RAIL channel and reports it once; the session itself goes on.
+    pub(crate) fn mark_unavailable(&mut self, reason: String) {
+        if self.phase == RailPhase::Unavailable {
+            return;
+        }
+        warn!(%reason, "RAIL unavailable");
+        self.phase = RailPhase::Unavailable;
+        self.publish_state(Some(reason));
     }
 
     #[cfg(test)]
@@ -858,6 +892,53 @@ mod tests {
         assert!(matches!(windows[0], RailWindowEvent::Created(_)));
         assert!(matches!(windows[2], RailWindowEvent::Updated { reannounced: true, .. }));
         assert_eq!(windows[3], RailWindowEvent::Deleted { id: 8 });
+    }
+
+    #[test]
+    fn window_moves_update_the_tracker_locally() {
+        let mut harness = established();
+        harness.rail.on_windowing_orders(&app_window(7));
+        let window_move = RailOp::window_move(7, 100, 50, 800, 600).unwrap();
+
+        assert_eq!(
+            sent(harness.rail.on_op(&mut harness.client, window_move).unwrap()).len(),
+            1
+        );
+
+        let windows = harness.sink.windows.borrow();
+        assert!(matches!(
+            windows.last(),
+            Some(RailWindowEvent::Updated { local: true, .. })
+        ));
+        let shared = harness.shared.borrow();
+        assert_eq!(shared.windows[0].window_rect.left, 100);
+        assert_eq!(shared.windows[0].window_rect.width, 800);
+        assert!(RailOp::window_move(7, 0, 0, 0, 10).is_err());
+    }
+
+    #[test]
+    fn unavailable_rail_stops_sending() {
+        let mut harness = established();
+        harness.rail.mark_unavailable("no channel".to_owned());
+        harness.rail.mark_unavailable("again".to_owned());
+
+        assert_eq!(harness.rail.phase(), RailPhase::Unavailable);
+        let resync = harness.rail.on_op(&mut harness.client, RailOp::Resync).unwrap();
+        assert!(sent(resync).is_empty());
+        assert!(sent(harness.rail.on_tick(&mut harness.client).unwrap()).is_empty());
+        let states = harness.sink.states.borrow();
+        let last = states.last().unwrap();
+        assert_eq!(
+            (last.phase, last.warning.as_deref()),
+            (RailPhase::Unavailable, Some("no channel"))
+        );
+        assert_eq!(
+            states
+                .iter()
+                .filter(|state| state.phase == RailPhase::Unavailable)
+                .count(),
+            1
+        );
     }
 
     #[test]
