@@ -249,6 +249,7 @@ pub mod ffi {
                 work_dir: String::new(),
                 remote_application_mode: false,
                 rail_support_level: ironrdp::pdu::rdp::capability_sets::RailSupportLevel::empty(),
+                remote_application_send_alternate_shell: false,
             };
             let dvc_pipe_proxy = self.dvc_pipe_proxy.clone();
 

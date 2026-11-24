@@ -1568,6 +1568,7 @@ fn build_config(
         work_dir: String::new(),
         remote_application_mode: false,
         rail_support_level: ironrdp::pdu::rdp::capability_sets::RailSupportLevel::SUPPORTED,
+        remote_application_send_alternate_shell: false,
     }
 }
 

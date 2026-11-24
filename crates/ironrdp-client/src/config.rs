@@ -1963,6 +1963,7 @@ impl ConfigBuilder {
             },
             remote_application_mode,
             rail_support_level,
+            remote_application_send_alternate_shell: false,
         };
 
         // To avoid easily leaking secrets, strip any known secret property before returning the resulting Config.

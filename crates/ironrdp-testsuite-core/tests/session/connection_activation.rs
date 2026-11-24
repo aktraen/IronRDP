@@ -71,6 +71,7 @@ fn test_config() -> ironrdp_connector::Config {
         work_dir: String::new(),
         remote_application_mode: false,
         rail_support_level: ironrdp_pdu::rdp::capability_sets::RailSupportLevel::SUPPORTED,
+        remote_application_send_alternate_shell: false,
     }
 }
 

@@ -916,6 +916,7 @@ mod tests {
             work_dir: String::new(),
             remote_application_mode: false,
             rail_support_level: RailSupportLevel::SUPPORTED,
+            remote_application_send_alternate_shell: false,
         }
     }
 }

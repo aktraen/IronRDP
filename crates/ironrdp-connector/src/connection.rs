@@ -1830,11 +1830,12 @@ fn create_client_info_pdu(
     };
 
     // MS-RDPERP requires RemoteApp launch data on the RAIL channel.
-    let (alternate_shell, work_dir) = if config.remote_application_mode {
-        (String::new(), String::new())
-    } else {
-        (config.alternate_shell.clone(), config.work_dir.clone())
-    };
+    let (alternate_shell, work_dir) =
+        if config.remote_application_mode && !config.remote_application_send_alternate_shell {
+            (String::new(), String::new())
+        } else {
+            (config.alternate_shell.clone(), config.work_dir.clone())
+        };
 
     let client_info = ClientInfo {
         credentials: Credentials {
@@ -1888,9 +1889,8 @@ mod tests {
     use super::{create_client_info_pdu, create_gcc_blocks};
     use crate::{Config, Credentials, DesktopSize};
 
-    #[test]
-    fn remote_application_client_info_uses_rail_launch_data() {
-        let config = Config {
+    fn remote_application_config() -> Config {
+        Config {
             desktop_size: DesktopSize {
                 width: 1024,
                 height: 768,
@@ -1920,6 +1920,7 @@ mod tests {
             work_dir: "C:\\apps".into(),
             remote_application_mode: true,
             rail_support_level: RailSupportLevel::SUPPORTED,
+            remote_application_send_alternate_shell: false,
             platform: MajorPlatformType::UNIX,
             hardware_id: None,
             request_data: None,
@@ -1934,7 +1935,12 @@ mod tests {
             pointer_software_rendering: false,
             multitransport_flags: None,
             support_dyn_vc_gfx_protocol: false,
-        };
+        }
+    }
+
+    #[test]
+    fn remote_application_client_info_uses_rail_launch_data() {
+        let config = remote_application_config();
 
         let client_info = create_client_info_pdu(&config, &"127.0.0.1:3389".parse().unwrap(), None).client_info;
 
@@ -1942,6 +1948,20 @@ mod tests {
         assert!(client_info.alternate_shell.is_empty());
         assert!(client_info.work_dir.is_empty());
         assert!(!client_info.flags.contains(ClientInfoFlags::AUDIO_CAPTURE));
+    }
+
+    #[test]
+    fn remote_application_client_info_keeps_alternate_shell_when_requested() {
+        let config = Config {
+            remote_application_send_alternate_shell: true,
+            ..remote_application_config()
+        };
+
+        let client_info = create_client_info_pdu(&config, &"127.0.0.1:3389".parse().unwrap(), None).client_info;
+
+        assert!(client_info.flags.contains(ClientInfoFlags::RAIL));
+        assert_eq!(client_info.alternate_shell, "app.exe");
+        assert_eq!(client_info.work_dir, "C:\\apps");
     }
 
     #[test]
@@ -1976,6 +1996,7 @@ mod tests {
             work_dir: String::new(),
             remote_application_mode: false,
             rail_support_level: RailSupportLevel::empty(),
+            remote_application_send_alternate_shell: false,
             platform: MajorPlatformType::UNIX,
             hardware_id: None,
             request_data: None,
@@ -2041,6 +2062,7 @@ mod tests {
             work_dir: String::new(),
             remote_application_mode: false,
             rail_support_level: RailSupportLevel::empty(),
+            remote_application_send_alternate_shell: false,
             platform: MajorPlatformType::UNIX,
             hardware_id: None,
             request_data: None,

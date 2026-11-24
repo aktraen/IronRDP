@@ -242,6 +242,14 @@ pub struct Config {
     /// This must include [`capability_sets::RailSupportLevel::SUPPORTED`] when
     /// [`Self::remote_application_mode`] is enabled.
     pub rail_support_level: capability_sets::RailSupportLevel,
+    /// Keep [`Self::alternate_shell`] and [`Self::work_dir`] in the Client Info PDU in RemoteApp mode.
+    ///
+    /// [MS-RDPERP] servers take launch data from the RAIL channel, so RemoteApp mode blanks both
+    /// fields unless this is set. Servers such as xrdp read the alternate shell from the Client
+    /// Info PDU instead.
+    ///
+    /// [MS-RDPERP]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdperp/
+    pub remote_application_send_alternate_shell: bool,
     pub platform: capability_sets::MajorPlatformType,
     /// Unique identifier for the computer
     ///

@@ -1094,5 +1094,6 @@ pub(super) fn default_client_config() -> connector::Config {
         work_dir: String::new(),
         remote_application_mode: false,
         rail_support_level: pdu::rdp::capability_sets::RailSupportLevel::SUPPORTED,
+        remote_application_send_alternate_shell: false,
     }
 }
